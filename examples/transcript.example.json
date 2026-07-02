@@ -1,0 +1,23 @@
+{
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 4.2,
+      "speaker": "Therapist",
+      "text": "今天想从哪里开始谈？"
+    },
+    {
+      "start": 4.3,
+      "end": 12.8,
+      "speaker": "Client",
+      "text": "我最近睡得不太好，工作上的事情一直在脑子里转。"
+    },
+    {
+      "start": 12.9,
+      "end": 20.0,
+      "speaker": "Therapist",
+      "text": "听起来这些工作压力在休息时间也很难放下。"
+    }
+  ]
+}
+

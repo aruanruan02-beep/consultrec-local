@@ -1,0 +1,10 @@
+.DS_Store
+.pycache_tmp/
+__pycache__/
+*.py[cod]
+
+.venv/
+node_modules/
+tsconfig.tsbuildinfo
+
+data/
