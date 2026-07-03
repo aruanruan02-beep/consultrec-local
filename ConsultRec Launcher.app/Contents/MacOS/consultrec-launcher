@@ -1,0 +1,73 @@
+#!/bin/zsh
+set -u
+
+PROJECT_DIR="/Users/ruanruan/开发/本地版咨询录音处理系统"
+HOST="127.0.0.1"
+PORTS=(8000 8001 8002 8003 8004 8005)
+LOG_DIR="$PROJECT_DIR/.launcher"
+LOG_FILE="$LOG_DIR/consultrec-launcher.log"
+
+mkdir -p "$LOG_DIR"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+is_consultrec_running() {
+  local port="$1"
+  /usr/bin/curl -fsS "http://$HOST:$port/api/config" >/dev/null 2>&1
+}
+
+open_app() {
+  local port="$1"
+  /usr/bin/open "http://$HOST:$port/"
+}
+
+if [ ! -d "$PROJECT_DIR" ]; then
+  /usr/bin/osascript -e 'display alert "找不到项目目录" message "请确认本地版咨询录音处理系统项目仍在原来的位置。"'
+  exit 1
+fi
+
+if [ ! -x "$PROJECT_DIR/.venv/bin/python" ]; then
+  /usr/bin/osascript -e 'display alert "找不到 Python 环境" message "请先在项目目录中准备 .venv。"' 
+  exit 1
+fi
+
+for port in "${PORTS[@]}"; do
+  if is_consultrec_running "$port"; then
+    log "Service already running on port $port"
+    open_app "$port"
+    exit 0
+  fi
+done
+
+selected_port=""
+for port in "${PORTS[@]}"; do
+  if ! /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    selected_port="$port"
+    break
+  fi
+done
+
+if [ -z "$selected_port" ]; then
+  /usr/bin/osascript -e 'display alert "没有可用端口" message "8000-8005 都已被占用，请关闭占用端口的程序后再试。"' 
+  exit 1
+fi
+
+log "Starting consultrec on port $selected_port"
+cd "$PROJECT_DIR" || exit 1
+
+nohup "$PROJECT_DIR/.venv/bin/python" -m consultrec serve --host "$HOST" --port "$selected_port" >> "$LOG_FILE" 2>&1 &
+
+for _ in {1..60}; do
+  if is_consultrec_running "$selected_port"; then
+    log "Service ready on port $selected_port"
+    open_app "$selected_port"
+    exit 0
+  fi
+  sleep 0.25
+done
+
+log "Service failed to become ready on port $selected_port"
+/usr/bin/osascript -e 'display alert "启动失败" message "本地服务没有正常启动。请查看项目目录 .launcher/consultrec-launcher.log。"' 
+exit 1
