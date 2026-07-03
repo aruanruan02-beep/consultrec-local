@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
+  Checkbox,
   DatePicker,
   Descriptions,
+  Drawer,
   Empty,
   Form,
   Grid,
@@ -30,6 +32,7 @@ import {
   IconRobot,
   IconSettings,
   IconUpload,
+  IconFolder,
 } from "@arco-design/web-react/icon";
 
 const { Sider, Content } = Layout;
@@ -50,15 +53,16 @@ const PROCESSING_STATUSES = new Set([
 const DEFAULT_SETTINGS: Settings = {
   data_root: "data",
   whisper_command:
-    ".venv/bin/python scripts/transcribe_faster_whisper.py --audio {audio} --output {transcript_json} --model medium",
-  diarization_command:
-    ".venv/bin/python scripts/diarize_voice_features.py --audio {audio} --transcript-json {transcript_json} --output {diarization_json}",
+    ".venv/bin/python scripts/transcribe_whisperx.py --audio {audio} --output {transcript_json} --model small --language zh --device cpu --compute-type int8 --min-speakers 2 --max-speakers 2",
+  diarization_command: "",
   llm_command: ".venv/bin/python scripts/generate_note_ollama.py --prompt-file {prompt_file} --model qwen2.5:7b-instruct",
   clinical_prompt_path: "prompts/clinical_note_prompt.md",
+  hf_token: "",
+  prompt_template: "",
 };
 
 type ViewName = "records" | "session" | "settings";
-type Speaker = "Therapist" | "Client" | "Unknown";
+type Speaker = "咨询师" | "来访者" | "说话人 1" | "说话人 2" | "未确认";
 
 type CaseItem = {
   case_id: string;
@@ -88,6 +92,7 @@ type TranscriptSegment = {
 type ClinicalNote = {
   session_summary?: Record<string, string[]>;
   soap?: Record<string, string[]>;
+  raw_text?: string;
 };
 
 type SessionDetail = SessionSummary & {
@@ -106,6 +111,8 @@ type Settings = {
   diarization_command: string;
   llm_command: string;
   clinical_prompt_path: string;
+  hf_token: string;
+  prompt_template?: string;
 };
 
 type UploadValues = {
@@ -161,13 +168,19 @@ function formatDateLabel(value?: string) {
 }
 
 function normalizeSpeaker(value?: string): Speaker {
-  return value === "Therapist" || value === "Client" ? value : "Unknown";
+  if (value === "Therapist") return "咨询师";
+  if (value === "Client") return "来访者";
+  if (value === "咨询师" || value === "来访者" || value === "说话人 1" || value === "说话人 2") return value;
+  return "未确认";
 }
 
 function summarizeWhisper(command: string) {
   if (!command) return "尚未配置";
   const modelMatch = command.match(/--model\s+([^\s]+)/);
-  return `faster-whisper ${modelMatch ? modelMatch[1] : "本地模型"}`;
+  if (command.includes("transcribe_whisperx.py") || command.includes("whisperx")) {
+    return `WhisperX ${modelMatch ? modelMatch[1] : "本地模型"}`;
+  }
+  return `Whisper ${modelMatch ? modelMatch[1] : "本地模型"}`;
 }
 
 function summarizeLLM(command: string) {
@@ -177,7 +190,7 @@ function summarizeLLM(command: string) {
 }
 
 function summarizeDiarization(command: string) {
-  if (!command) return "未启用";
+  if (!command) return "已并入 WhisperX 转写";
   if (command.includes("diarize_voice_features.py")) return "本地声音特征分组";
   return "已配置";
 }
@@ -210,7 +223,15 @@ export default function App() {
   const [savingSettings, setSavingSettings] = useState(false);
   const [transcriptDraft, setTranscriptDraft] = useState<TranscriptSegment[]>([]);
   const [uploadForm] = Form.useForm<UploadValues>();
-  const [settingsForm] = Form.useForm<Settings>();
+  const [repoForm] = Form.useForm();
+  const [hfForm] = Form.useForm();
+  const [commandsForm] = Form.useForm();
+  const [promptText, setPromptText] = useState("");
+  const [tempPromptText, setTempPromptText] = useState("");
+  const [promptDrawerVisible, setPromptDrawerVisible] = useState(false);
+  const [isRepoDirty, setIsRepoDirty] = useState(false);
+  const [isHfDirty, setIsHfDirty] = useState(false);
+  const [isCommandsDirty, setIsCommandsDirty] = useState(false);
   const pollTimer = useRef<number | null>(null);
 
   const loadCases = useCallback(async () => {
@@ -252,12 +273,28 @@ export default function App() {
     try {
       const data = { ...DEFAULT_SETTINGS, ...(await api<Partial<Settings>>("/api/config")) };
       setSettings(data);
-      settingsForm.setFieldsValue(data);
+      repoForm.setFieldsValue({
+        data_root: data.data_root,
+        clinical_prompt_path: data.clinical_prompt_path,
+      });
+      hfForm.setFieldsValue({
+        hf_token: data.hf_token,
+      });
+      commandsForm.setFieldsValue({
+        whisper_command: data.whisper_command,
+        llm_command: data.llm_command,
+      });
+      setPromptText(data.prompt_template || "");
+      setTempPromptText(data.prompt_template || "");
     } catch (error) {
       console.warn("Unable to load settings, showing defaults.", error);
-      settingsForm.setFieldsValue(DEFAULT_SETTINGS);
+      repoForm.setFieldsValue(DEFAULT_SETTINGS);
+      hfForm.setFieldsValue(DEFAULT_SETTINGS);
+      commandsForm.setFieldsValue(DEFAULT_SETTINGS);
+      setPromptText("");
+      setTempPromptText("");
     }
-  }, [settingsForm]);
+  }, [repoForm, hfForm, commandsForm]);
 
   useEffect(() => {
     loadCases().catch((error) => console.warn("Unable to load cases.", error));
@@ -339,10 +376,10 @@ export default function App() {
       await loadSessions();
     };
 
-    if (transcriptDraft.some((item) => !["Therapist", "Client"].includes(String(item.speaker)))) {
+    if (transcriptDraft.some((item) => !["咨询师", "来访者"].includes(normalizeSpeaker(String(item.speaker))))) {
       Modal.confirm({
         title: "还有未确认角色",
-        content: "仍有片段未确认成咨询师或来访者，仍然继续生成记录吗？",
+        content: "仍有片段保留为说话人标签或未确认，仍然继续生成记录吗？",
         okText: "继续生成",
         cancelText: "返回检查",
         onOk: run,
@@ -379,21 +416,77 @@ export default function App() {
     }
   };
 
-  const submitSettings = async () => {
-    const values = await settingsForm.validate();
-    setSavingSettings(true);
+  const saveConfig = async (patch: Partial<Settings>) => {
     try {
+      const currentValues = {
+        data_root: repoForm.getFieldValue("data_root") ?? settings.data_root,
+        clinical_prompt_path: repoForm.getFieldValue("clinical_prompt_path") ?? settings.clinical_prompt_path,
+        hf_token: hfForm.getFieldValue("hf_token") ?? settings.hf_token,
+        whisper_command: commandsForm.getFieldValue("whisper_command") ?? settings.whisper_command,
+        llm_command: commandsForm.getFieldValue("llm_command") ?? settings.llm_command,
+        prompt_template: promptText,
+        ...patch,
+      };
       const data = await api<Settings>("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(values),
+        body: JSON.stringify(currentValues),
       });
       setSettings(data);
-      settingsForm.setFieldsValue(data);
+      repoForm.setFieldsValue({
+        data_root: data.data_root,
+        clinical_prompt_path: data.clinical_prompt_path,
+      });
+      hfForm.setFieldsValue({
+        hf_token: data.hf_token,
+      });
+      commandsForm.setFieldsValue({
+        whisper_command: data.whisper_command,
+        llm_command: data.llm_command,
+      });
+      setPromptText(data.prompt_template || "");
+      setTempPromptText(data.prompt_template || "");
       Message.success("设置已保存");
-    } finally {
-      setSavingSettings(false);
+    } catch (error) {
+      Message.error("保存设置失败");
+      console.error(error);
     }
+  };
+
+  const saveRepoSettings = async () => {
+    const values = await repoForm.validate();
+    await saveConfig(values);
+  };
+
+  const handleSelectDirectory = async () => {
+    try {
+      const res = await api<{ path?: string; error?: string }>("/api/config/select_directory", {
+        method: "POST",
+      });
+      if (res.path) {
+        repoForm.setFieldValue("data_root", res.path);
+        setIsRepoDirty(true);
+      } else if (res.error && res.error !== "User canceled.") {
+        Message.error(`选择文件夹失败: ${res.error}`);
+      }
+    } catch (error) {
+      Message.error("选择文件夹时发生错误");
+      console.error(error);
+    }
+  };
+
+  const saveHfSettings = async () => {
+    const values = await hfForm.validate();
+    await saveConfig(values);
+  };
+
+  const saveCommandsSettings = async () => {
+    const values = await commandsForm.validate();
+    await saveConfig(values);
+  };
+
+  const savePromptTemplate = async (newText: string) => {
+    await saveConfig({ prompt_template: newText });
   };
 
   const columns = useMemo(
@@ -424,13 +517,15 @@ export default function App() {
       {
         title: "状态",
         dataIndex: "status",
+        align: "center" as const,
         render: (_: unknown, item: SessionSummary) => <StatusTag status={item.status} label={item.progress_label} />,
       },
       {
         title: "操作",
         dataIndex: "actions",
+        align: "left" as const,
         render: (_: unknown, item: SessionSummary) => (
-          <Space wrap size={14}>
+          <Space size={14} align="center">
             <Button className="record-action-button" type="text" size="small" onClick={() => openSession(item.case_id, item.session_id)}>
               查看详情
             </Button>
@@ -552,57 +647,111 @@ export default function App() {
             <div className="page-header settings-header">
               <Title heading={4}>设置</Title>
             </div>
-            <Form form={settingsForm} layout="vertical" initialValues={settings} onSubmit={submitSettings}>
-              <div className="settings-block">
-                <Title heading={6}>本地资料库</Title>
-                <Row gutter={16}>
-                  <Col span={12}>
-                    <FormItem label="数据保存位置" field="data_root" rules={[{ required: true, message: "请输入数据保存位置" }]}>
-                      <Input placeholder="data" />
-                    </FormItem>
-                  </Col>
-                  <Col span={12}>
-                    <FormItem label="Prompt 文件" field="clinical_prompt_path" rules={[{ required: true, message: "请输入 Prompt 文件" }]}>
-                      <Input placeholder="prompts/clinical_note_prompt.md" />
-                    </FormItem>
-                  </Col>
-                </Row>
-              </div>
 
-              <div className="settings-block">
-                <Title heading={6}>本地模型</Title>
-                <Descriptions
-                  column={1}
-                  data={[
-                    { label: "转写模型", value: summarizeWhisper(settingsForm.getFieldValue("whisper_command") || settings.whisper_command) },
-                    {
-                      label: "说话人区分",
-                      value: summarizeDiarization(settingsForm.getFieldValue("diarization_command") || settings.diarization_command),
-                    },
-                    { label: "本地大模型", value: summarizeLLM(settingsForm.getFieldValue("llm_command") || settings.llm_command) },
-                  ]}
-                />
-              </div>
-
-              <div className="settings-block">
-                <Title heading={6}>高级命令模板</Title>
-                <FormItem label="Whisper 命令" field="whisper_command">
-                  <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
-                </FormItem>
-                <FormItem label="说话人区分命令" field="diarization_command">
-                  <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
-                </FormItem>
-                <FormItem label="LLM 命令" field="llm_command">
-                  <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
-                </FormItem>
-              </div>
-
-              <div className="settings-actions">
-                <Button type="primary" htmlType="submit" loading={savingSettings}>
-                  保存设置
+            {/* Block 1: 提示词 (放在最上面) */}
+            <div className="settings-block">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <Title heading={6} style={{ margin: 0 }}>提示词</Title>
+                <Button type="primary" icon={<IconEdit />} onClick={() => {
+                  setTempPromptText(promptText);
+                  setPromptDrawerVisible(true);
+                }}>
+                  编辑提示词
                 </Button>
               </div>
-            </Form>
+              <div style={{ marginBottom: 12 }}>
+                <Text type="secondary">
+                  自定义大模型提取咨询记录 (Session Summary & SOAP) 的模板和生成规范。
+                </Text>
+              </div>
+              <div style={{
+                padding: "12px 16px",
+                background: "var(--color-fill-1, #f2f3f5)",
+                borderRadius: 4,
+                maxHeight: 140,
+                overflowY: "auto",
+                fontFamily: "monospace",
+                fontSize: 12,
+                color: "var(--color-text-2, #4e5969)",
+                border: "1px solid var(--color-border-1, #f2f3f5)",
+                whiteSpace: "pre-wrap"
+              }}>
+                {promptText || "暂无提示词模板"}
+              </div>
+            </div>
+
+            {/* Block 2: 数据保存位置 (单独列出, 用选择文件夹方式) */}
+            <div className="settings-block">
+              <Title heading={6}>数据保存位置</Title>
+              <Form form={repoForm} layout="vertical" onValuesChange={() => setIsRepoDirty(true)}>
+                <FormItem label="本地保存位置" field="data_root" rules={[{ required: true, message: "请选择或输入数据保存位置" }]}>
+                  <Input
+                    placeholder="请选择或输入保存数据的绝对路径"
+                    addAfter={
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<IconFolder />}
+                        onClick={handleSelectDirectory}
+                        style={{ padding: "0 8px", height: "auto" }}
+                      >
+                        选择文件夹
+                      </Button>
+                    }
+                  />
+                </FormItem>
+                {isRepoDirty && (
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+                    <Space>
+                      <Button size="small" onClick={() => {
+                        repoForm.setFieldsValue({
+                          data_root: settings.data_root,
+                        });
+                        setIsRepoDirty(false);
+                      }}>
+                        取消
+                      </Button>
+                      <Button type="primary" size="small" onClick={async () => {
+                        await saveRepoSettings();
+                        setIsRepoDirty(false);
+                      }}>
+                        保存
+                      </Button>
+                    </Space>
+                  </div>
+                )}
+              </Form>
+            </div>
+
+            {/* Block 3: Hugging Face 设置 */}
+            <div className="settings-block">
+              <Title heading={6}>Hugging Face 设置</Title>
+              <Form form={hfForm} layout="vertical" onValuesChange={() => setIsHfDirty(true)}>
+                <FormItem label="Hugging Face Read Token (HF_TOKEN) - 用于 WhisperX 说话人区分功能" field="hf_token">
+                  <Input.Password placeholder="hf_..." />
+                </FormItem>
+                {isHfDirty && (
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+                    <Space>
+                      <Button size="small" onClick={() => {
+                        hfForm.setFieldsValue({
+                          hf_token: settings.hf_token,
+                        });
+                        setIsHfDirty(false);
+                      }}>
+                        取消
+                      </Button>
+                      <Button type="primary" size="small" onClick={async () => {
+                        await saveHfSettings();
+                        setIsHfDirty(false);
+                      }}>
+                        保存
+                      </Button>
+                    </Space>
+                  </div>
+                )}
+              </Form>
+            </div>
           </section>
         )}
       </Content>
@@ -643,6 +792,35 @@ export default function App() {
           </FormItem>
         </Form>
       </Modal>
+
+      <Drawer
+        title="编辑提示词模板"
+        visible={promptDrawerVisible}
+        width={640}
+        onCancel={() => {
+          setPromptDrawerVisible(false);
+          setTempPromptText(promptText);
+        }}
+        onOk={async () => {
+          await savePromptTemplate(tempPromptText);
+          setPromptDrawerVisible(false);
+        }}
+        okText="保存"
+        cancelText="取消"
+        unmountOnExit
+      >
+        <div style={{ marginBottom: 16 }}>
+          <Text type="secondary">
+            提示词模板中必须包含 <code>{"{{TRANSCRIPT}}"}</code> 占位符，系统会在生成时自动将其替换为咨询逐字稿。
+          </Text>
+        </div>
+        <TextArea
+          value={tempPromptText}
+          onChange={(val) => setTempPromptText(val)}
+          style={{ height: "calc(100vh - 220px)", fontFamily: "monospace", fontSize: 13, lineHeight: 1.5 }}
+          placeholder="输入大模型的提示词规范..."
+        />
+      </Drawer>
     </Layout>
   );
 }
@@ -667,13 +845,126 @@ function SessionDetailView({
   onRetry: () => void;
   onRerunDiarization: () => void;
   onRegenerate: () => void;
-  onSaveTranscript: () => void;
-  onSubmitReview: () => void;
+  onSaveTranscript: () => Promise<void> | void;
+  onSubmitReview: () => Promise<void> | void;
 }) {
   const disabled = data.status === "generating_note";
+  const [editMode, setEditMode] = useState<boolean>(false);
+  const [activeTab, setActiveTab] = useState<string>("summary");
+
+  useEffect(() => {
+    if (data.status === "awaiting_review") {
+      setEditMode(true);
+    } else {
+      setEditMode(false);
+    }
+  }, [data.session_id, data.status]);
+
+  const handleCopy = () => {
+    if (!data.clinical_note) return;
+    let textToCopy = "";
+    if (activeTab === "summary") {
+      if (data.clinical_note.raw_text) {
+        textToCopy = data.clinical_note.raw_text;
+      } else {
+        textToCopy = Object.entries(data.clinical_note.session_summary || {})
+          .map(([key, val]) => `${key}:\n${val.map((v) => `- ${v}`).join("\n")}`)
+          .join("\n\n");
+      }
+    } else {
+      if (data.clinical_note.raw_text) {
+        textToCopy = data.clinical_note.raw_text;
+      } else {
+        textToCopy = Object.entries(data.clinical_note.soap || {})
+          .map(([key, val]) => `${key}:\n${val.map((v) => `- ${v}`).join("\n")}`)
+          .join("\n\n");
+      }
+    }
+
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(textToCopy);
+      Message.success("内容已复制到剪贴板");
+    } else {
+      Message.error("复制失败，您的浏览器不支持剪贴板操作");
+    }
+  };
 
   const setSegment = (index: number, patch: Partial<TranscriptSegment>) => {
     setTranscriptDraft(transcriptDraft.map((item, current) => (current === index ? { ...item, ...patch } : item)));
+  };
+
+  const [speakerModalVisible, setSpeakerModalVisible] = useState(false);
+  const [speakerEditIndex, setSpeakerEditIndex] = useState<number | null>(null);
+  const [speakerOldValue, setSpeakerOldValue] = useState("");
+  const [speakerNewValue, setSpeakerNewValue] = useState("");
+  const [batchUpdate, setBatchUpdate] = useState(false);
+
+  const handleSpeakerChangeTrigger = (index: number, newSpeaker: string) => {
+    const oldSpeaker = normalizeSpeaker(String(transcriptDraft[index]?.speaker || "未确认"));
+    const normalizedNewSpeaker = normalizeSpeaker(newSpeaker);
+    if (oldSpeaker === normalizedNewSpeaker) return;
+
+    setSpeakerEditIndex(index);
+    setSpeakerOldValue(oldSpeaker);
+    setSpeakerNewValue(normalizedNewSpeaker);
+    setBatchUpdate(false); // Default to unchecked as in mockup
+    setSpeakerModalVisible(true);
+  };
+
+  const getSpeakerOptions = (currentSpeaker: string) => {
+    const baseOptions = ["咨询师", "来访者", "未确认"];
+    const activeSpeakers = Array.from(
+      new Set(transcriptDraft.map((item) => normalizeSpeaker(String(item.speaker || "未确认"))))
+    );
+    const combined = Array.from(new Set([...baseOptions, ...activeSpeakers]));
+    if (!combined.includes(currentSpeaker)) {
+      combined.push(currentSpeaker);
+    }
+    return combined;
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>, index: number, item: TranscriptSegment) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      const textarea = e.currentTarget;
+      const cursorPos = textarea.selectionStart;
+      const text = item.text || "";
+      const part1 = text.substring(0, cursorPos);
+      const part2 = text.substring(cursorPos);
+
+      const start = item.start;
+      const end = item.end;
+      const l1 = part1.length;
+      const l2 = part2.length;
+      let splitTime = start + (end - start) / 2;
+      if (l1 + l2 > 0) {
+        splitTime = start + (end - start) * (l1 / (l1 + l2));
+      }
+      splitTime = Math.round(splitTime * 100) / 100;
+
+      const newSegments = [...transcriptDraft];
+      newSegments[index] = {
+        ...item,
+        text: part1,
+        end: splitTime,
+      };
+      const newSeg: TranscriptSegment = {
+        start: splitTime,
+        end: end,
+        speaker: item.speaker,
+        text: part2,
+      };
+      newSegments.splice(index + 1, 0, newSeg);
+      setTranscriptDraft(newSegments);
+
+      setTimeout(() => {
+        const nextTextarea = document.querySelector(`.segment-textarea-${index + 1}`) as HTMLTextAreaElement | null;
+        if (nextTextarea) {
+          nextTextarea.focus();
+          nextTextarea.setSelectionRange(0, 0);
+        }
+      }, 50);
+    }
   };
 
   return (
@@ -697,11 +988,6 @@ function SessionDetailView({
               重新自动整理
             </Button>
           )}
-          {data.status === "complete" && Boolean(data.transcript?.length) && (
-            <Button icon={<IconEdit />} onClick={onRegenerate}>
-              重新生成记录
-            </Button>
-          )}
           <Button icon={<IconRefresh />} onClick={onRefresh}>
             刷新
           </Button>
@@ -710,12 +996,22 @@ function SessionDetailView({
 
       <div className="detail-grid">
         <aside className="summary-pane">
-          <Tabs defaultActiveTab="summary">
+          <Tabs
+            activeTab={activeTab}
+            onChange={(key) => setActiveTab(key)}
+            extra={
+              data.clinical_note && (
+                <Button size="small" type="text" onClick={handleCopy}>
+                  复制内容
+                </Button>
+              )
+            }
+          >
             <Tabs.TabPane key="summary" title="Summary">
-              <ClinicalSummary note={data.clinical_note || null} />
+              <ClinicalSummary note={data.clinical_note || null} status={data.status} />
             </Tabs.TabPane>
             <Tabs.TabPane key="soap" title="SOAP">
-              <SoapNote note={data.clinical_note || null} />
+              <SoapNote note={data.clinical_note || null} status={data.status} />
             </Tabs.TabPane>
           </Tabs>
         </aside>
@@ -723,93 +1019,205 @@ function SessionDetailView({
         <section className="transcript-pane">
           <div className="pane-head">
             <Title heading={5}>文字记录</Title>
-            <Text type="secondary">
-              {transcriptDraft.length
-                ? data.diarization_configured
-                  ? "系统已自动分段并标注角色，可直接修改错误的角色。"
-                  : "系统已生成逐字稿，可直接修改角色。"
-                : `逐字稿生成后会显示在这里。${progressHint(data)}`}
-            </Text>
           </div>
-          <Spin loading={Boolean(data.is_processing && !transcriptDraft.length)} className="transcript-spin">
-            <div className="transcript-list">
-              {!transcriptDraft.length ? (
-                <Empty description="还没有逐字稿。" />
-              ) : (
-                transcriptDraft.map((item, index) => (
-                  <div className="segment" key={`${item.start}-${item.end}-${index}`}>
-                    <Text type="secondary" className="segment-time">
-                      {formatTime(item.start)} - {formatTime(item.end)}
-                    </Text>
-                    <Select
-                      value={normalizeSpeaker(String(item.speaker || "Unknown"))}
-                      disabled={disabled}
-                      onChange={(speaker) => setSegment(index, { speaker })}
-                    >
-                      <Select.Option value="Therapist">咨询师</Select.Option>
-                      <Select.Option value="Client">来访者</Select.Option>
-                      <Select.Option value="Unknown">未确认</Select.Option>
-                    </Select>
-                    <TextArea
-                      value={item.text || ""}
-                      disabled={disabled}
-                      autoSize={{ minRows: 2, maxRows: 8 }}
-                      onChange={(text) => setSegment(index, { text })}
-                    />
-                  </div>
-                ))
-              )}
+          {data.is_processing && !transcriptDraft.length ? (
+            <div className="processing-empty-state">
+              <Spin tip="正在生成文字记录，请稍候……" />
             </div>
-          </Spin>
+          ) : !transcriptDraft.length ? (
+            <Empty description="还没有逐字稿。" />
+          ) : (
+            <div className="transcript-list">
+              {transcriptDraft.map((item, index) => (
+                <div className="segment" key={`${item.start}-${item.end}-${index}`}>
+                  <Text type="secondary" className="segment-time">
+                    {formatTime(item.start)} - {formatTime(item.end)}
+                  </Text>
+                  {editMode ? (
+                    <>
+                      <Select
+                        value={normalizeSpeaker(String(item.speaker || "Unknown"))}
+                        disabled={disabled}
+                        onChange={(speaker) => handleSpeakerChangeTrigger(index, speaker)}
+                      >
+                        {getSpeakerOptions(normalizeSpeaker(String(item.speaker || "未确认"))).map((opt) => (
+                          <Select.Option key={opt} value={opt}>
+                            {opt}
+                          </Select.Option>
+                        ))}
+                      </Select>
+                      <TextArea
+                        value={item.text || ""}
+                        className={`segment-textarea-${index}`}
+                        disabled={disabled}
+                        autoSize={{ minRows: 2, maxRows: 8 }}
+                        onChange={(text) => setSegment(index, { text })}
+                        onKeyDown={(e) => handleKeyDown(e, index, item)}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <div className="segment-speaker-readonly">
+                        <Tag color={item.speaker === "咨询师" ? "arcoblue" : item.speaker === "来访者" ? "green" : "gray"}>
+                          {item.speaker || "未确认"}
+                        </Tag>
+                      </div>
+                      <div className="segment-text-readonly">
+                        <Text>{item.text}</Text>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
           <div className="review-bar">
-            <Text type="secondary">
-              {data.status === "awaiting_review"
-                ? "修改后可以先保存，也可以直接生成记录。"
-                : data.status === "complete"
-                  ? "记录已生成。如需修改，可保存后重新生成记录。"
-                  : progressHint(data)}
-            </Text>
+            <div className="review-bar-left" />
             <Space>
-              {(data.status === "awaiting_review" || data.status === "complete") && (
-                <Button icon={<IconEdit />} onClick={onSaveTranscript}>
-                  保存修改
-                </Button>
-              )}
-              {data.status === "awaiting_review" && (
-                <Button type="primary" onClick={onSubmitReview}>
-                  生成记录
-                </Button>
+              {!editMode ? (
+                (data.status === "awaiting_review" || data.status === "complete" || data.status === "error") && (
+                  <Button type="primary" onClick={() => setEditMode(true)}>
+                    编辑
+                  </Button>
+                )
+              ) : (
+                data.status === "awaiting_review" ? (
+                  <Button type="primary" onClick={onSubmitReview}>
+                    生成记录
+                  </Button>
+                ) : (
+                  <>
+                    <Button onClick={async () => {
+                      await onSaveTranscript();
+                      setEditMode(false);
+                    }}>
+                      保存
+                    </Button>
+                    <Button type="primary" onClick={onSubmitReview}>
+                      保存并重新生成记录
+                    </Button>
+                  </>
+                )
               )}
             </Space>
           </div>
         </section>
       </div>
+      <Modal
+        title="修改说话人"
+        visible={speakerModalVisible}
+        onCancel={() => {
+          setSpeakerModalVisible(false);
+          setSpeakerEditIndex(null);
+        }}
+        onOk={() => {
+          if (speakerEditIndex === null) return;
+          if (batchUpdate) {
+            setTranscriptDraft(
+              transcriptDraft.map((item) =>
+                normalizeSpeaker(String(item.speaker || "未确认")) === speakerOldValue
+                  ? { ...item, speaker: speakerNewValue }
+                  : item
+              )
+            );
+          } else {
+            setTranscriptDraft(
+              transcriptDraft.map((item, current) =>
+                current === speakerEditIndex ? { ...item, speaker: speakerNewValue } : item
+              )
+            );
+          }
+          setSpeakerModalVisible(false);
+          setSpeakerEditIndex(null);
+        }}
+        okText="完成"
+        cancelText="取消"
+        unmountOnExit
+      >
+        <div style={{ marginBottom: 20 }}>
+          <Text>将该片段的说话人修改为：</Text>
+          <Tag color="arcoblue" style={{ marginLeft: 8, fontSize: 14, padding: "4px 8px" }}>{speakerNewValue}</Tag>
+        </div>
+        <div style={{ padding: "8px 0" }}>
+          <Checkbox checked={batchUpdate} onChange={(checked) => setBatchUpdate(checked)}>
+            {`批量修改全文中所有 ${
+              transcriptDraft.filter(
+                (item) => normalizeSpeaker(String(item.speaker || "未确认")) === speakerOldValue
+              ).length
+            } 处 “${speakerOldValue}”`}
+          </Checkbox>
+        </div>
+      </Modal>
     </section>
   );
 }
 
-function ClinicalSummary({ note }: { note: ClinicalNote | null }) {
+function ClinicalSummary({ note, status }: { note: ClinicalNote | null; status?: string }) {
+  if (status === "generating_note" || status === "queued_note_generation") {
+    return (
+      <div className="processing-empty-state">
+        <Spin tip="正在生成 Session Summary，请稍候……" />
+      </div>
+    );
+  }
   if (!note) return <Empty description="确认角色后，系统会生成 Session Summary。" />;
+
+  if (note.raw_text) {
+    return (
+      <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.6, padding: "8px 16px" }}>
+        <Text>{note.raw_text}</Text>
+      </div>
+    );
+  }
+
+  const summary = note.session_summary || {};
+  const keys = Object.keys(summary);
+  if (keys.length === 0) {
+    return <Empty description="未输出 Session Summary 记录内容。" />;
+  }
+
   return (
     <div className="note-stack">
-      {["本次主题", "核心问题", "情绪变化", "咨询师主要回应方式", "会谈结构", "关键转折点"].map((key) => (
+      {keys.map((key) => (
         <section className="note-section" key={key}>
           <Title heading={6}>{key}</Title>
-          <NoteList items={note.session_summary?.[key]} />
+          <NoteList items={summary[key]} />
         </section>
       ))}
     </div>
   );
 }
 
-function SoapNote({ note }: { note: ClinicalNote | null }) {
+function SoapNote({ note, status }: { note: ClinicalNote | null; status?: string }) {
+  if (status === "generating_note" || status === "queued_note_generation") {
+    return (
+      <div className="processing-empty-state">
+        <Spin tip="正在生成 SOAP 记录，请稍候……" />
+      </div>
+    );
+  }
   if (!note) return <Empty description="确认角色后，系统会生成 SOAP 记录。" />;
+
+  if (note.raw_text) {
+    return (
+      <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.6, padding: "8px 16px" }}>
+        <Text>{note.raw_text}</Text>
+      </div>
+    );
+  }
+
+  const soap = note.soap || {};
+  const keys = Object.keys(soap);
+  if (keys.length === 0) {
+    return <Empty description="未输出 SOAP 记录内容。" />;
+  }
+
   return (
     <div className="note-stack">
-      {["S", "O", "A", "P"].map((key) => (
+      {keys.map((key) => (
         <section className="note-section" key={key}>
           <Title heading={6}>{key}</Title>
-          <NoteList items={note.soap?.[key]} />
+          <NoteList items={soap[key]} />
         </section>
       ))}
     </div>

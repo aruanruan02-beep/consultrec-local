@@ -59,15 +59,31 @@ def run_llm_command(
 def parse_clinical_note(text: str) -> ClinicalNote:
     payload = _extract_json(text)
     if payload is None:
-        note = DEFAULT_NOTE.copy()
         return ClinicalNote(
-            soap=note["soap"],
-            session_summary=note["session_summary"],
+            soap={},
+            session_summary={},
             raw_text=text.strip(),
         )
+
+    soap = {}
+    raw_soap = payload.get("soap", {})
+    if isinstance(raw_soap, dict):
+        for k, v in raw_soap.items():
+            soap[k] = _as_list(v)
+
+    summary = {}
+    raw_summary = payload.get("session_summary", {})
+    if isinstance(raw_summary, dict):
+        for k, v in raw_summary.items():
+            summary[k] = _as_list(v)
+
+    if not soap and not summary:
+        for k, v in payload.items():
+            summary[k] = _as_list(v)
+
     return ClinicalNote(
-        soap=_ensure_soap(payload.get("soap", {})),
-        session_summary=_ensure_summary(payload.get("session_summary", {})),
+        soap=soap,
+        session_summary=summary,
         raw_text=None,
     )
 
@@ -86,21 +102,6 @@ def _extract_json(text: str):
         except json.JSONDecodeError:
             continue
     return None
-
-
-def _ensure_soap(value):
-    return {
-        key: _as_list(value.get(key, [])) if isinstance(value, dict) else []
-        for key in ["S", "O", "A", "P"]
-    }
-
-
-def _ensure_summary(value):
-    keys = ["本次主题", "核心问题", "情绪变化", "咨询师主要回应方式", "会谈结构", "关键转折点"]
-    return {
-        key: _as_list(value.get(key, [])) if isinstance(value, dict) else []
-        for key in keys
-    }
 
 
 def _as_list(value):

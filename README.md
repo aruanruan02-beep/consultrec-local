@@ -6,15 +6,15 @@
 
 - 浏览器上传单个音频文件：`mp3` / `wav` / `m4a`
 - 按 Case ID 和 Session 日期自动归档
-- 调用本地离线语音转写工具，生成带时间轴逐字稿
-- 支持咨询师 / 来访者角色标注
+- 调用本地 WhisperX 流程，生成带时间轴和说话人标签的逐字稿
+- 支持把“说话人 1 / 说话人 2”手动映射为咨询师 / 来访者
 - 在生成临床记录前校对说话人角色
 - 动态加载独立 Prompt 文件，调用本地 LLM 生成：
   - SOAP 记录
   - Session Summary
 - 输出每个 session 的 Markdown 与 JSON
 
-> 本项目不包含云端 API 调用，也不需要网络。你需要在本机提前准备可用的离线 ASR 与本地 LLM 命令，例如 whisper.cpp 与 llama.cpp。
+> 处理过程在本机运行。WhisperX 首次运行会下载 ASR / diarization 模型；说话人分离需要配置 Hugging Face read token，并接受 pyannote diarization 模型的使用条款。
 
 ## 快速开始
 
@@ -48,7 +48,7 @@ python3 -m consultrec --help
 python3 -m consultrec process ./audio/session01.m4a \
   --session-id session01 \
   --output-dir ./sessions \
-  --asr-command 'whisper-cli -m ./models/ggml-large-v3-turbo.bin -f {audio} -oj -of {asr_output_stem}' \
+  --asr-command '.venv/bin/python scripts/transcribe_whisperx.py --audio {audio} --output {asr_output_json} --model small --language zh --device cpu --compute-type int8 --min-speakers 2 --max-speakers 2' \
   --llm-command 'llama-cli -m ./models/local-model.gguf -f {prompt_file}'
 ```
 
@@ -81,12 +81,15 @@ Prompt 独立存放在：
 - `data/cases/{case_id}/sessions/{session_date}_{session_id}/session.md`
 - `data/cases/{case_id}/sessions/{session_date}_{session_id}/session.json`
 
-## 角色区分
+## 说话人区分
 
-工具支持三种来源：
+默认转写命令使用 WhisperX 一次生成文字、时间戳和 speaker 字段：
 
-- 转写 JSON 中已经包含 `speaker` 字段
-- 提供离线说话人区分命令：`--diarization-command`
-- 使用 `--roles-mode alternating` 做本地草稿标注
+```json
+{
+  "speaker": "说话人 1",
+  "text": "..."
+}
+```
 
-建议正式使用时接入本地 diarization 工具，并用 `--therapist-speaker` / `--client-speaker` 固定说话人映射。
+前端结果页会保留 `说话人 1 / 说话人 2`，由用户手动映射为 `咨询师 / 来访者`，并支持逐段继续修改。

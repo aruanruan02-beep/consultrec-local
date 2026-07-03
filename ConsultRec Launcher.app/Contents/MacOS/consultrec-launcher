@@ -57,7 +57,13 @@ fi
 log "Starting consultrec on port $selected_port"
 cd "$PROJECT_DIR" || exit 1
 
-nohup "$PROJECT_DIR/.venv/bin/python" -m consultrec serve --host "$HOST" --port "$selected_port" >> "$LOG_FILE" 2>&1 &
+# Run python with appropriate architecture if on Apple Silicon to prevent Rosetta translation issues with arm64 native binary libraries (e.g. pydantic_core)
+PYTHON_CMD=("$PROJECT_DIR/.venv/bin/python")
+if [ "$(uname -m)" = "arm64" ]; then
+  PYTHON_CMD=(arch -arm64 "${PYTHON_CMD[@]}")
+fi
+
+nohup "${PYTHON_CMD[@]}" -m consultrec serve --host "$HOST" --port "$selected_port" >> "$LOG_FILE" 2>&1 &
 
 for _ in {1..60}; do
   if is_consultrec_running "$selected_port"; then

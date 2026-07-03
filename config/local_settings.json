@@ -1,7 +1,8 @@
 {
   "data_root": "data",
-  "whisper_command": ".venv/bin/python scripts/transcribe_faster_whisper.py --audio {audio} --output {transcript_json} --model medium",
-  "diarization_command": ".venv/bin/python scripts/diarize_voice_features.py --audio {audio} --transcript-json {transcript_json} --output {diarization_json}",
+  "whisper_command": ".venv/bin/python scripts/transcribe_whisperx.py --audio {audio} --output {transcript_json} --model small --language zh --device cpu --compute-type int8 --min-speakers 2 --max-speakers 2",
+  "diarization_command": "",
   "llm_command": ".venv/bin/python scripts/generate_note_ollama.py --prompt-file {prompt_file} --model qwen2.5:7b-instruct",
-  "clinical_prompt_path": "prompts/clinical_note_prompt.md"
+  "clinical_prompt_path": "prompts/clinical_note_prompt.md",
+  "hf_token": "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"
 }

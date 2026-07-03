@@ -3,4 +3,5 @@ uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 faster-whisper>=1.2.0
 imageio-ffmpeg>=0.5.1
+whisperx>=3.3.0
 ollama>=0.3.0

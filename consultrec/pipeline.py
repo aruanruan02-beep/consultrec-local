@@ -17,7 +17,7 @@ def process_session(
     llm_command: str,
     asr_command: Optional[str] = None,
     transcript_json: Optional[Path] = None,
-    roles_mode: str = "existing",
+    roles_mode: str = "preserve",
     diarization_command: Optional[str] = None,
     therapist_speaker: Optional[str] = None,
     client_speaker: Optional[str] = None,
@@ -45,4 +45,3 @@ def process_session(
     prompt = load_clinical_prompt(prompt_path, transcript_for_prompt(segments))
     note = run_llm_command(llm_command, prompt, output_dir / ".work" / session_id / "llm")
     write_outputs(output_dir, session_id, audio_path, segments, note)
-

@@ -73,7 +73,7 @@ def merge_semantic_segments(
 def transcript_for_prompt(segments: Iterable[TranscriptSegment]) -> str:
     lines = []
     for segment in segments:
-        role = segment.speaker or "Unknown"
+        role = segment.speaker or "未确认"
         lines.append(
             f"[{format_time(segment.start)} - {format_time(segment.end)}] "
             f"{role}: {segment.text}"
@@ -115,8 +115,8 @@ def _segment_from_dict(item: Dict[str, Any]) -> TranscriptSegment:
 
 
 def _normalized_speaker(value: str) -> str:
-    speaker = (value or "Unknown").strip()
-    return speaker or "Unknown"
+    speaker = (value or "未确认").strip()
+    return speaker or "未确认"
 
 
 def _looks_like_continuation(text: str) -> bool:

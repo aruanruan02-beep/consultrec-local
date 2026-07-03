@@ -30,9 +30,9 @@ def main() -> None:
     process.add_argument("--llm-command", required=True, help="本地 LLM 命令模板，支持 {prompt_file}")
     process.add_argument(
         "--roles-mode",
-        choices=["existing", "alternating"],
-        default="existing",
-        help="角色标注方式。existing 使用已有 speaker 字段；alternating 用于草稿。",
+        choices=["preserve", "existing", "alternating"],
+        default="preserve",
+        help="角色标注方式。preserve 保留已有 speaker 字段；alternating 用于草稿。",
     )
     process.add_argument("--diarization-command", help="离线说话人区分命令模板")
     process.add_argument("--therapist-speaker", help="把该 speaker 映射为 Therapist")

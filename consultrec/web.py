@@ -9,7 +9,6 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import LocalSettings, load_settings, save_settings, settings_from_dict
-from .diarization import infer_clinical_roles
 from .processor import (
     cancel_running_session,
     generate_clinical_note,
@@ -46,14 +45,45 @@ def index():
 
 @app.get("/api/config")
 def get_config():
-    return settings().__dict__
+    current_settings = settings()
+    res = current_settings.__dict__.copy()
+    prompt_path = current_settings.prompt_path
+    if prompt_path.exists():
+        res["prompt_template"] = prompt_path.read_text(encoding="utf-8")
+    else:
+        res["prompt_template"] = ""
+    return res
 
 
 @app.post("/api/config")
 async def update_config(payload: Dict[str, str]):
     new_settings = settings_from_dict(payload)
     save_settings(new_settings)
-    return new_settings.__dict__
+    if "prompt_template" in payload:
+        prompt_path = new_settings.prompt_path
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(payload["prompt_template"], encoding="utf-8")
+    res = new_settings.__dict__.copy()
+    prompt_path = new_settings.prompt_path
+    if prompt_path.exists():
+        res["prompt_template"] = prompt_path.read_text(encoding="utf-8")
+    else:
+        res["prompt_template"] = ""
+    return res
+@app.post("/api/config/select_directory")
+def select_directory():
+    import subprocess
+    try:
+        cmd = "osascript -e 'POSIX path of (choose folder with prompt \"选择数据保存位置\")'"
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+        if proc.returncode == 0:
+            path = proc.stdout.strip()
+            return {"path": path}
+        else:
+            return {"error": proc.stderr.strip() or "User canceled."}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 
 @app.get("/api/cases")
@@ -120,10 +150,9 @@ def get_session(case_id: str, session_id: str):
     payload = enrich_session_summary(record.__dict__)
     payload["diarization_configured"] = bool(current_settings.diarization_command.strip())
     if record.transcript_path and Path(record.transcript_path).exists():
-        segments = infer_clinical_roles(load_transcript_json(Path(record.transcript_path)))
         payload["transcript"] = [
             item.to_dict()
-            for item in merge_semantic_segments(segments)
+            for item in merge_semantic_segments(load_transcript_json(Path(record.transcript_path)))
         ]
     if record.note_json_path and Path(record.note_json_path).exists():
         payload["clinical_note"] = json.loads(Path(record.note_json_path).read_text(encoding="utf-8"))
@@ -169,9 +198,10 @@ async def save_transcript(
     if not record.transcript_path:
         raise HTTPException(status_code=400, detail="Transcript is not ready.")
     update_transcript_roles(repository, record, payload.get("segments", []))
-    record.status = "awaiting_review"
-    record.note_json_path = ""
-    record.markdown_path = ""
+    if record.status != "complete":
+        record.status = "awaiting_review"
+        record.note_json_path = ""
+        record.markdown_path = ""
     repository.save_session(record)
     return enrich_session_summary(record.__dict__)
 

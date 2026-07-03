@@ -13,7 +13,7 @@ class TranscriptSegment:
         return {
             "start": self.start,
             "end": self.end,
-            "speaker": self.speaker or "Unknown",
+            "speaker": self.speaker or "未确认",
             "text": self.text,
         }
 
@@ -32,4 +32,3 @@ class ClinicalNote:
         if self.raw_text:
             data["raw_text"] = self.raw_text
         return data
-

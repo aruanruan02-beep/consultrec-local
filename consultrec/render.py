@@ -48,7 +48,7 @@ def render_markdown(
     for segment in segments:
         lines.append(
             f"- `{format_time(segment.start)} - {format_time(segment.end)}` "
-            f"**{segment.speaker or 'Unknown'}**：{segment.text}"
+            f"**{segment.speaker or '未确认'}**：{segment.text}"
         )
 
     lines.extend(["", "## SOAP", ""])
@@ -73,4 +73,3 @@ def _bullet_list(items):
     if not items:
         return ["- 逐字稿中未明确提及"]
     return [f"- {item}" for item in items]
-

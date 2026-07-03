@@ -2,6 +2,7 @@ import os
 import signal
 import shlex
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List
@@ -41,7 +42,7 @@ def run_transcription_stage(settings: LocalSettings, repo: LocalRepository, reco
 
     record.status = "transcribing"
     repo.save_session(record)
-    repo.append_log(record, "Starting Whisper transcription.")
+    repo.append_log(record, "Starting WhisperX transcription.")
 
     session_dir = repo.find_session_dir(record.case_id, record.session_id)
     transcript_path = session_dir / "transcript.json"
@@ -149,15 +150,24 @@ def run_diarization_stage(settings: LocalSettings, repo: LocalRepository, record
 
 
 def update_transcript_roles(repo: LocalRepository, record: SessionRecord, segments_payload: List[Dict[str, object]]) -> SessionRecord:
-    segments = [
-        TranscriptSegment(
-            start=float(item["start"]),
-            end=float(item["end"]),
-            speaker=str(item.get("speaker") or "Unknown"),
-            text=str(item.get("text") or ""),
+    try:
+        import zhconv
+    except ImportError:
+        zhconv = None
+
+    segments = []
+    for item in segments_payload:
+        text = str(item.get("text") or "")
+        if zhconv:
+            text = zhconv.convert(text, 'zh-hans')
+        segments.append(
+            TranscriptSegment(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                speaker=str(item.get("speaker") or "未确认"),
+                text=text,
+            )
         )
-        for item in segments_payload
-    ]
     transcript_path = Path(record.transcript_path)
     save_transcript_json(transcript_path, segments)
     repo.append_log(record, "Transcript roles were updated by user review.")
@@ -186,11 +196,11 @@ def _run_diarization(
     record: SessionRecord,
     segments: List[TranscriptSegment],
 ) -> List[TranscriptSegment]:
-    # Reuse the existing command-template integration. It writes diarization.output.json
-    # and maps speaker turns back onto transcript segments by midpoint.
+    # Custom diarization commands can still map speaker turns back onto transcript segments,
+    # but role inference is intentionally left to user review.
     return assign_roles(
         segments=segments,
-        mode="clinical",
+        mode="preserve",
         diarization_command=settings.diarization_command,
         audio_path=Path(record.audio_path),
         work_dir=repo.find_session_dir(record.case_id, record.session_id),
@@ -198,24 +208,30 @@ def _run_diarization(
 
 
 def _run_cancelable_command(command: str, repo: LocalRepository, record: SessionRecord) -> None:
-    process = subprocess.Popen(shlex.split(command))
-    _record_process_pid(repo, record, process.pid)
-    try:
-        while process.poll() is None:
-            latest = repo.get_session(record.case_id, record.session_id)
-            if latest.status == "canceled":
-                _terminate_pid(process.pid)
-                raise TaskCanceled("Task was canceled by user.")
-            time.sleep(0.8)
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, shlex.split(command))
-    finally:
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8"
+    ) as stderr_file:
+        process = subprocess.Popen(shlex.split(command), stdout=stdout_file, stderr=stderr_file, text=True)
+        _record_process_pid(repo, record, process.pid)
         try:
-            latest = repo.get_session(record.case_id, record.session_id)
-        except FileNotFoundError:
-            return
-        latest.process_pid = 0
-        repo.save_session(latest)
+            while process.poll() is None:
+                latest = repo.get_session(record.case_id, record.session_id)
+                if latest.status == "canceled":
+                    _terminate_pid(process.pid)
+                    raise TaskCanceled("Task was canceled by user.")
+                time.sleep(0.8)
+            if process.returncode != 0:
+                stderr_file.seek(0)
+                stdout_file.seek(0)
+                message = (stderr_file.read() or stdout_file.read() or "").strip()
+                raise RuntimeError(message or f"Command returned non-zero exit status {process.returncode}.")
+        finally:
+            try:
+                latest = repo.get_session(record.case_id, record.session_id)
+            except FileNotFoundError:
+                return
+            latest.process_pid = 0
+            repo.save_session(latest)
 
 
 def _record_process_pid(repo: LocalRepository, record: SessionRecord, pid: int) -> None:
@@ -256,7 +272,11 @@ def _matching_session_processes(record: SessionRecord) -> List[tuple]:
         if pid == os.getpid():
             continue
         is_session_process = audio_path in command or session_id in command
-        is_known_worker = "transcribe_faster_whisper.py" in command or "generate_note_ollama.py" in command
+        is_known_worker = (
+            "transcribe_faster_whisper.py" in command
+            or "transcribe_whisperx.py" in command
+            or "generate_note_ollama.py" in command
+        )
         if is_session_process and is_known_worker:
             matches.append((pid, command))
     return matches
