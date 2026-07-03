@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
+# Limit thread counts for CPU libraries to prevent 100% CPU starvation on M1 Mac
+import os
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
+
 import argparse
 import json
-import os
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -64,25 +71,96 @@ def transcribe_with_whisperx(
     ensure_ffmpeg_on_path()
     os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
+    import gc
+    import torch
+    torch.set_num_threads(4)
     import whisperx
 
+    # 1. Transcribe (runs on CPU by default as CTranslate2 lacks MPS support)
+    print("Loading Whisper transcription model...")
     audio = whisperx.load_audio(audio_path)
     model = whisperx.load_model(model_name, device, compute_type=compute_type, language=language)
+    print("Transcribing audio...")
     result = model.transcribe(audio, batch_size=batch_size, language=language)
 
-    language_code = result.get("language") or language
-    align_model, metadata = whisperx.load_align_model(language_code=language_code, device=device)
-    result = whisperx.align(
-        result["segments"],
-        align_model,
-        metadata,
-        audio,
-        device,
-        return_char_alignments=False,
-    )
+    # Free transcription model memory immediately
+    print("Freeing transcription model memory...")
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
-    diarize_model = whisperx.diarize.DiarizationPipeline(use_auth_token=hf_token, device=device)
-    diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+    # 2. Align (runs on MPS for GPU acceleration if available)
+    language_code = result.get("language") or language
+    align_device = "mps" if (device == "cpu" and torch.backends.mps.is_available()) else device
+
+    print(f"Loading alignment model on device: {align_device}...")
+    try:
+        align_model, metadata = whisperx.load_align_model(language_code=language_code, device=align_device)
+        print("Aligning segments...")
+        result = whisperx.align(
+            result["segments"],
+            align_model,
+            metadata,
+            audio,
+            align_device,
+            return_char_alignments=False,
+        )
+    except Exception as e:
+        if align_device == "mps":
+            print(f"MPS alignment failed ({e}), falling back to CPU...")
+            align_device = "cpu"
+            align_model, metadata = whisperx.load_align_model(language_code=language_code, device=align_device)
+            result = whisperx.align(
+                result["segments"],
+                align_model,
+                metadata,
+                audio,
+                align_device,
+                return_char_alignments=False,
+            )
+        else:
+            raise e
+
+    # Free alignment model memory immediately
+    print("Freeing alignment model memory...")
+    del align_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    # 3. Diarize (runs on MPS for GPU acceleration if available)
+    diarize_device = "mps" if (device == "cpu" and torch.backends.mps.is_available()) else device
+
+    print(f"Loading diarization pipeline on device: {diarize_device}...")
+    try:
+        diarize_model = whisperx.diarize.DiarizationPipeline(use_auth_token=hf_token, device=diarize_device)
+        print("Diarizing speakers...")
+        diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+    except Exception as e:
+        if diarize_device == "mps":
+            print(f"MPS diarization failed ({e}), falling back to CPU...")
+            diarize_device = "cpu"
+            diarize_model = whisperx.diarize.DiarizationPipeline(use_auth_token=hf_token, device=diarize_device)
+            diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+        else:
+            raise e
+
+    # Free diarization model memory immediately
+    print("Freeing diarization model memory...")
+    del diarize_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    # Final speaker assignment
+    print("Assigning speakers to segments...")
     result = whisperx.assign_word_speakers(diarize_segments, result)
 
     return normalize_whisperx_segments(result.get("segments", []))
