@@ -125,8 +125,25 @@ type UploadValues = {
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, options);
   if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.detail || response.statusText);
+    let msg = response.statusText;
+    try {
+      const data = await response.json();
+      if (data && data.detail) {
+        if (typeof data.detail === "string") {
+          msg = data.detail;
+        } else if (Array.isArray(data.detail)) {
+          msg = data.detail.map((err: any) => `${err.loc?.join(".") || "field"}: ${err.msg}`).join("; ");
+        } else if (typeof data.detail === "object") {
+          msg = JSON.stringify(data.detail);
+        }
+      }
+    } catch (e) {
+      try {
+        const text = await response.text();
+        if (text) msg = text;
+      } catch (inner) {}
+    }
+    throw new Error(msg);
   }
   return response.json();
 }
@@ -458,8 +475,8 @@ export default function App() {
       setPromptText(data.prompt_template || "");
       setTempPromptText(data.prompt_template || "");
       Message.success("设置已保存");
-    } catch (error) {
-      Message.error("保存设置失败");
+    } catch (error: any) {
+      Message.error("保存设置失败: " + (error instanceof Error ? error.message : String(error)));
       console.error(error);
     }
   };
@@ -480,8 +497,8 @@ export default function App() {
       } else if (res.error && res.error !== "User canceled.") {
         Message.error(`选择文件夹失败: ${res.error}`);
       }
-    } catch (error) {
-      Message.error("选择文件夹时发生错误");
+    } catch (error: any) {
+      Message.error("选择文件夹时发生错误: " + (error instanceof Error ? error.message : String(error)));
       console.error(error);
     }
   };
@@ -897,7 +914,7 @@ function SessionDetailView({
       await onSaveClinicalNote(noteDraft);
       setIsEditingNote(false);
     } catch (e) {
-      Message.error("保存修改失败: " + e);
+      Message.error("保存修改失败: " + (e instanceof Error ? e.message : String(e)));
     } finally {
       setSavingNote(false);
     }
