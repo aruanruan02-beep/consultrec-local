@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
-  Collapse,
   DatePicker,
   Descriptions,
   Empty,
@@ -23,11 +22,12 @@ import {
   Upload,
 } from "@arco-design/web-react";
 import {
-  IconDelete,
+  IconArrowLeft,
   IconEdit,
   IconFileAudio,
   IconHome,
   IconRefresh,
+  IconRobot,
   IconSettings,
   IconUpload,
 } from "@arco-design/web-react/icon";
@@ -401,7 +401,6 @@ export default function App() {
       {
         title: "文件",
         dataIndex: "file_name",
-        width: 360,
         render: (_: unknown, item: SessionSummary) => (
           <Space>
             <span className="file-mark">
@@ -416,27 +415,23 @@ export default function App() {
           </Space>
         ),
       },
-      { title: "Case", dataIndex: "case_id", width: 130 },
+      { title: "Case", dataIndex: "case_id" },
       {
         title: "日期",
         dataIndex: "session_date",
-        width: 150,
         render: (value: string) => value || "-",
       },
       {
         title: "状态",
         dataIndex: "status",
-        width: 150,
         render: (_: unknown, item: SessionSummary) => <StatusTag status={item.status} label={item.progress_label} />,
       },
       {
         title: "操作",
         dataIndex: "actions",
-        width: 300,
-        fixed: "right" as const,
         render: (_: unknown, item: SessionSummary) => (
-          <Space wrap>
-            <Button type="text" size="small" onClick={() => openSession(item.case_id, item.session_id)}>
+          <Space wrap size={14}>
+            <Button className="record-action-button" type="text" size="small" onClick={() => openSession(item.case_id, item.session_id)}>
               查看详情
             </Button>
             {item.is_processing && (
@@ -446,13 +441,13 @@ export default function App() {
                 cancelText="返回"
                 onOk={() => cancelSession(item)}
               >
-                <Button type="text" status="warning" size="small">
+                <Button className="record-action-button" type="text" status="warning" size="small">
                   取消任务
                 </Button>
               </Popconfirm>
             )}
             {item.next_action === "retry" && (
-              <Button type="text" size="small" onClick={() => retryTranscription(item.case_id, item.session_id)}>
+              <Button className="record-action-button" type="text" size="small" onClick={() => retryTranscription(item.case_id, item.session_id)}>
                 重试
               </Button>
             )}
@@ -462,7 +457,7 @@ export default function App() {
               cancelText="取消"
               onOk={() => deleteSession(item)}
             >
-              <Button type="text" status="danger" size="small" icon={<IconDelete />}>
+              <Button className="record-action-button record-action-danger" type="text" size="small">
                 删除
               </Button>
             </Popconfirm>
@@ -524,7 +519,6 @@ export default function App() {
               columns={columns}
               data={sessions}
               pagination={false}
-              scroll={{ x: 1090 }}
               noDataElement={<Empty description="还没有记录。点击右上角“上传录音”开始处理。" />}
             />
           </section>
@@ -555,7 +549,9 @@ export default function App() {
 
         {view === "settings" && (
           <section className="page settings-page">
-            <Title heading={4}>设置</Title>
+            <div className="page-header settings-header">
+              <Title heading={4}>设置</Title>
+            </div>
             <Form form={settingsForm} layout="vertical" initialValues={settings} onSubmit={submitSettings}>
               <div className="settings-block">
                 <Title heading={6}>本地资料库</Title>
@@ -588,19 +584,18 @@ export default function App() {
                 />
               </div>
 
-              <Collapse className="settings-block" defaultActiveKey={[]}>
-                <Collapse.Item header="高级命令模板" name="commands">
-                  <FormItem label="Whisper 命令" field="whisper_command">
-                    <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
-                  </FormItem>
-                  <FormItem label="说话人区分命令" field="diarization_command">
-                    <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
-                  </FormItem>
-                  <FormItem label="LLM 命令" field="llm_command">
-                    <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
-                  </FormItem>
-                </Collapse.Item>
-              </Collapse>
+              <div className="settings-block">
+                <Title heading={6}>高级命令模板</Title>
+                <FormItem label="Whisper 命令" field="whisper_command">
+                  <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
+                </FormItem>
+                <FormItem label="说话人区分命令" field="diarization_command">
+                  <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
+                </FormItem>
+                <FormItem label="LLM 命令" field="llm_command">
+                  <TextArea autoSize={{ minRows: 3, maxRows: 6 }} />
+                </FormItem>
+              </div>
 
               <div className="settings-actions">
                 <Button type="primary" htmlType="submit" loading={savingSettings}>
@@ -684,7 +679,13 @@ function SessionDetailView({
   return (
     <section className="page session-page">
       <div className="detail-header">
-        <Button onClick={onBack}>返回记录</Button>
+        <Button
+          icon={<IconArrowLeft />}
+          shape="circle"
+          onClick={onBack}
+          aria-label="返回记录"
+          title="返回记录"
+        />
         <div className="detail-title">
           <Title heading={4}>{`${data.case_id || "-"}，${formatDateLabel(data.session_date)}`}</Title>
           <StatusTag status={data.status} label={data.progress_label} />
@@ -692,9 +693,15 @@ function SessionDetailView({
         <Space wrap className="detail-actions">
           {data.status === "error" && <Button onClick={onRetry}>重新转写</Button>}
           {Boolean(data.transcript?.length && data.diarization_configured && !data.is_processing) && (
-            <Button onClick={onRerunDiarization}>重新自动整理</Button>
+            <Button icon={<IconRobot />} onClick={onRerunDiarization}>
+              重新自动整理
+            </Button>
           )}
-          {data.status === "complete" && Boolean(data.transcript?.length) && <Button onClick={onRegenerate}>重新生成记录</Button>}
+          {data.status === "complete" && Boolean(data.transcript?.length) && (
+            <Button icon={<IconEdit />} onClick={onRegenerate}>
+              重新生成记录
+            </Button>
+          )}
           <Button icon={<IconRefresh />} onClick={onRefresh}>
             刷新
           </Button>
@@ -709,17 +716,6 @@ function SessionDetailView({
             </Tabs.TabPane>
             <Tabs.TabPane key="soap" title="SOAP">
               <SoapNote note={data.clinical_note || null} />
-            </Tabs.TabPane>
-            <Tabs.TabPane key="paths" title="文件">
-              <Descriptions
-                column={1}
-                data={[
-                  { label: "音频", value: data.audio_path || "-" },
-                  { label: "逐字稿", value: data.transcript_path || "-" },
-                  { label: "JSON", value: data.note_json_path || "-" },
-                  { label: "Markdown", value: data.markdown_path || "-" },
-                ]}
-              />
             </Tabs.TabPane>
           </Tabs>
         </aside>
