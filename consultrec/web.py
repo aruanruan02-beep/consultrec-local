@@ -2,7 +2,7 @@ import json
 import tempfile
 from datetime import date
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -204,6 +204,57 @@ async def save_transcript(
         record.markdown_path = ""
     repository.save_session(record)
     return enrich_session_summary(record.__dict__)
+
+
+@app.post("/api/sessions/{case_id}/{session_id}/note")
+async def save_clinical_note(
+    case_id: str,
+    session_id: str,
+    payload: Dict[str, Any],
+):
+    repository = repo()
+    record = repository.get_session(case_id, session_id)
+
+    # Save the updated JSON clinical note
+    note_path = repository.write_session_json(record, "clinical_note.json", payload)
+
+    # Update markdown if transcript exists
+    if record.transcript_path and Path(record.transcript_path).exists():
+        from .transcript import load_transcript_json
+        from .render import render_markdown
+        from .llm import _as_list
+        from .models import ClinicalNote as ModelClinicalNote
+
+        segments = load_transcript_json(Path(record.transcript_path))
+
+        soap_raw = payload.get("soap", {})
+        soap = {}
+        if isinstance(soap_raw, dict):
+            for k, v in soap_raw.items():
+                soap[k] = _as_list(v)
+
+        summary_raw = payload.get("session_summary", {})
+        summary = {}
+        if isinstance(summary_raw, dict):
+            for k, v in summary_raw.items():
+                summary[k] = _as_list(v)
+
+        raw_text = payload.get("raw_text")
+
+        note_obj = ModelClinicalNote(
+            soap=soap,
+            session_summary=summary,
+            raw_text=raw_text,
+        )
+
+        markdown = render_markdown(record.session_id, Path(record.audio_path), segments, note_obj)
+        markdown_path = repository.write_session_text(record, "session.md", markdown)
+
+        record.note_json_path = str(note_path)
+        record.markdown_path = str(markdown_path)
+        repository.save_session(record)
+
+    return get_session(case_id, session_id)
 
 
 @app.post("/api/sessions/{case_id}/{session_id}/transcribe")

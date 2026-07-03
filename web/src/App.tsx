@@ -364,6 +364,17 @@ export default function App() {
     Message.success("逐字稿修改已保存");
   };
 
+  const saveClinicalNote = async (data: SessionDetail, notePayload: ClinicalNote) => {
+    const updated = await api<SessionDetail>(`/api/sessions/${data.case_id}/${data.session_id}/note`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(notePayload),
+    });
+    Message.success("临床记录修改已保存");
+    setCurrentSession(updated);
+    await loadSessions();
+  };
+
   const submitReview = async (data: SessionDetail) => {
     const run = async () => {
       await api(`/api/sessions/${data.case_id}/${data.session_id}/review`, {
@@ -639,6 +650,11 @@ export default function App() {
               await loadSessions();
             }}
             onSubmitReview={() => submitReview(currentSession)}
+            onSaveClinicalNote={async (notePayload) => {
+              if (currentSession) {
+                await saveClinicalNote(currentSession, notePayload);
+              }
+            }}
           />
         )}
 
@@ -836,6 +852,7 @@ function SessionDetailView({
   onRegenerate,
   onSaveTranscript,
   onSubmitReview,
+  onSaveClinicalNote,
 }: {
   data: SessionDetail;
   transcriptDraft: TranscriptSegment[];
@@ -847,10 +864,14 @@ function SessionDetailView({
   onRegenerate: () => void;
   onSaveTranscript: () => Promise<void> | void;
   onSubmitReview: () => Promise<void> | void;
+  onSaveClinicalNote: (note: ClinicalNote) => Promise<void> | void;
 }) {
   const disabled = data.status === "generating_note";
   const [editMode, setEditMode] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<string>("summary");
+  const [isEditingNote, setIsEditingNote] = useState<boolean>(false);
+  const [noteDraft, setNoteDraft] = useState<ClinicalNote | null>(null);
+  const [savingNote, setSavingNote] = useState<boolean>(false);
 
   useEffect(() => {
     if (data.status === "awaiting_review") {
@@ -858,7 +879,29 @@ function SessionDetailView({
     } else {
       setEditMode(false);
     }
+    setIsEditingNote(false);
+    setNoteDraft(null);
   }, [data.session_id, data.status]);
+
+  const handleStartEditNote = () => {
+    if (data.clinical_note) {
+      setNoteDraft(JSON.parse(JSON.stringify(data.clinical_note)));
+      setIsEditingNote(true);
+    }
+  };
+
+  const handleSaveNote = async () => {
+    if (!noteDraft) return;
+    setSavingNote(true);
+    try {
+      await onSaveClinicalNote(noteDraft);
+      setIsEditingNote(false);
+    } catch (e) {
+      Message.error("保存修改失败: " + e);
+    } finally {
+      setSavingNote(false);
+    }
+  };
 
   const handleCopy = () => {
     if (!data.clinical_note) return;
@@ -1001,17 +1044,43 @@ function SessionDetailView({
             onChange={(key) => setActiveTab(key)}
             extra={
               data.clinical_note && (
-                <Button size="small" type="text" onClick={handleCopy}>
-                  复制内容
-                </Button>
+                <Space>
+                  {isEditingNote ? (
+                    <>
+                      <Button size="small" type="primary" status="success" loading={savingNote} onClick={handleSaveNote}>
+                        保存
+                      </Button>
+                      <Button size="small" onClick={() => setIsEditingNote(false)}>
+                        取消
+                      </Button>
+                    </>
+                  ) : (
+                    <Button size="small" type="outline" onClick={handleStartEditNote}>
+                      编辑
+                    </Button>
+                  )}
+                  <Button size="small" type="text" onClick={handleCopy}>
+                    复制内容
+                  </Button>
+                </Space>
               )
             }
           >
             <Tabs.TabPane key="summary" title="Summary">
-              <ClinicalSummary note={data.clinical_note || null} status={data.status} />
+              <ClinicalSummary
+                note={isEditingNote ? noteDraft : (data.clinical_note || null)}
+                status={data.status}
+                isEditing={isEditingNote}
+                onChange={setNoteDraft}
+              />
             </Tabs.TabPane>
             <Tabs.TabPane key="soap" title="SOAP">
-              <SoapNote note={data.clinical_note || null} status={data.status} />
+              <SoapNote
+                note={isEditingNote ? noteDraft : (data.clinical_note || null)}
+                status={data.status}
+                isEditing={isEditingNote}
+                onChange={setNoteDraft}
+              />
             </Tabs.TabPane>
           </Tabs>
         </aside>
@@ -1152,7 +1221,17 @@ function SessionDetailView({
   );
 }
 
-function ClinicalSummary({ note, status }: { note: ClinicalNote | null; status?: string }) {
+function ClinicalSummary({
+  note,
+  status,
+  isEditing,
+  onChange,
+}: {
+  note: ClinicalNote | null;
+  status?: string;
+  isEditing?: boolean;
+  onChange?: (note: ClinicalNote) => void;
+}) {
   if (status === "generating_note" || status === "queued_note_generation") {
     return (
       <div className="processing-empty-state">
@@ -1161,6 +1240,68 @@ function ClinicalSummary({ note, status }: { note: ClinicalNote | null; status?:
     );
   }
   if (!note) return <Empty description="确认角色后，系统会生成 Session Summary。" />;
+
+  if (isEditing) {
+    if (note.raw_text !== undefined && note.raw_text !== null) {
+      return (
+        <div style={{ padding: "8px 16px" }}>
+          <Title heading={6} style={{ marginBottom: "8px" }}>原始文本</Title>
+          <TextArea
+            autoSize={{ minRows: 10, maxRows: 25 }}
+            value={note.raw_text}
+            onChange={(val) => {
+              if (onChange) onChange({ ...note, raw_text: val });
+            }}
+          />
+        </div>
+      );
+    }
+    const summary = note.session_summary || {};
+    const keys = Object.keys(summary);
+    if (keys.length === 0) {
+      return (
+        <div style={{ padding: "8px 16px" }}>
+          <Button
+            type="outline"
+            size="small"
+            onClick={() => {
+              if (onChange) {
+                onChange({
+                  ...note,
+                  session_summary: { "本次会谈整体摘要": [""] }
+                });
+              }
+            }}
+          >
+            添加摘要字段
+          </Button>
+        </div>
+      );
+    }
+    return (
+      <div className="note-stack" style={{ padding: "8px 16px" }}>
+        {keys.map((key) => {
+          const val = (summary[key] || []).join("\n");
+          return (
+            <section className="note-section" key={key} style={{ marginBottom: "16px" }}>
+              <Title heading={6} style={{ marginBottom: "8px" }}>{key}</Title>
+              <TextArea
+                autoSize={{ minRows: 4, maxRows: 12 }}
+                value={val}
+                onChange={(newVal) => {
+                  const updatedSummary = { ...summary };
+                  updatedSummary[key] = newVal.split("\n");
+                  if (onChange) {
+                    onChange({ ...note, session_summary: updatedSummary });
+                  }
+                }}
+              />
+            </section>
+          );
+        })}
+      </div>
+    );
+  }
 
   if (note.raw_text) {
     return (
@@ -1188,7 +1329,17 @@ function ClinicalSummary({ note, status }: { note: ClinicalNote | null; status?:
   );
 }
 
-function SoapNote({ note, status }: { note: ClinicalNote | null; status?: string }) {
+function SoapNote({
+  note,
+  status,
+  isEditing,
+  onChange,
+}: {
+  note: ClinicalNote | null;
+  status?: string;
+  isEditing?: boolean;
+  onChange?: (note: ClinicalNote) => void;
+}) {
   if (status === "generating_note" || status === "queued_note_generation") {
     return (
       <div className="processing-empty-state">
@@ -1197,6 +1348,60 @@ function SoapNote({ note, status }: { note: ClinicalNote | null; status?: string
     );
   }
   if (!note) return <Empty description="确认角色后，系统会生成 SOAP 记录。" />;
+
+  if (isEditing) {
+    if (note.raw_text !== undefined && note.raw_text !== null) {
+      return (
+        <div style={{ padding: "8px 16px" }}>
+          <Title heading={6} style={{ marginBottom: "8px" }}>原始文本</Title>
+          <TextArea
+            autoSize={{ minRows: 10, maxRows: 25 }}
+            value={note.raw_text}
+            onChange={(val) => {
+              if (onChange) onChange({ ...note, raw_text: val });
+            }}
+          />
+        </div>
+      );
+    }
+    const soap = note.soap || {};
+    const keys = ["S (主观感觉)", "O (客观表现)", "A (评估分析)", "P (后续计划)"];
+
+    // Ensure all keys exist in draft
+    const ensureSoap = { ...soap };
+    keys.forEach((k) => {
+      if (!ensureSoap[k]) ensureSoap[k] = [];
+    });
+
+    return (
+      <div className="note-stack" style={{ padding: "8px 16px" }}>
+        {keys.map((key) => {
+          const val = (ensureSoap[key] || []).join("\n");
+          return (
+            <section className="note-section" key={key} style={{ marginBottom: "16px" }}>
+              <Title heading={6} style={{ marginBottom: "8px" }}>
+                {key}{" "}
+                <span style={{ fontSize: "12px", color: "var(--color-text-3)", fontWeight: "normal" }}>
+                  (每行代表一条记录)
+                </span>
+              </Title>
+              <TextArea
+                autoSize={{ minRows: 3, maxRows: 8 }}
+                value={val}
+                onChange={(newVal) => {
+                  const updatedSoap = { ...ensureSoap };
+                  updatedSoap[key] = newVal.split("\n").filter((line) => line.trim() !== "");
+                  if (onChange) {
+                    onChange({ ...note, soap: updatedSoap });
+                  }
+                }}
+              />
+            </section>
+          );
+        })}
+      </div>
+    );
+  }
 
   if (note.raw_text) {
     return (
