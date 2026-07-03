@@ -1050,18 +1050,15 @@ function SessionDetailView({
                       <Button size="small" type="primary" status="success" loading={savingNote} onClick={handleSaveNote}>
                         保存
                       </Button>
-                      <Button size="small" onClick={() => setIsEditingNote(false)}>
+                      <Button size="small" type="text" onClick={() => setIsEditingNote(false)}>
                         取消
                       </Button>
                     </>
                   ) : (
-                    <Button size="small" type="outline" onClick={handleStartEditNote}>
-                      编辑
+                    <Button size="small" type="text" onClick={handleCopy}>
+                      复制内容
                     </Button>
                   )}
-                  <Button size="small" type="text" onClick={handleCopy}>
-                    复制内容
-                  </Button>
                 </Space>
               )
             }
@@ -1071,6 +1068,7 @@ function SessionDetailView({
                 note={isEditingNote ? noteDraft : (data.clinical_note || null)}
                 status={data.status}
                 isEditing={isEditingNote}
+                onStartEdit={handleStartEditNote}
                 onChange={setNoteDraft}
               />
             </Tabs.TabPane>
@@ -1079,6 +1077,7 @@ function SessionDetailView({
                 note={isEditingNote ? noteDraft : (data.clinical_note || null)}
                 status={data.status}
                 isEditing={isEditingNote}
+                onStartEdit={handleStartEditNote}
                 onChange={setNoteDraft}
               />
             </Tabs.TabPane>
@@ -1225,11 +1224,13 @@ function ClinicalSummary({
   note,
   status,
   isEditing,
+  onStartEdit,
   onChange,
 }: {
   note: ClinicalNote | null;
   status?: string;
   isEditing?: boolean;
+  onStartEdit?: () => void;
   onChange?: (note: ClinicalNote) => void;
 }) {
   if (status === "generating_note" || status === "queued_note_generation") {
@@ -1305,7 +1306,11 @@ function ClinicalSummary({
 
   if (note.raw_text) {
     return (
-      <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.6, padding: "8px 16px" }}>
+      <div
+        onClick={onStartEdit}
+        style={{ whiteSpace: "pre-wrap", lineHeight: 1.6, padding: "8px 16px", cursor: "pointer" }}
+        title="点击内容进行编辑"
+      >
         <Text>{note.raw_text}</Text>
       </div>
     );
@@ -1318,7 +1323,12 @@ function ClinicalSummary({
   }
 
   return (
-    <div className="note-stack">
+    <div
+      className="note-stack clickable-note-stack"
+      onClick={onStartEdit}
+      style={{ cursor: "pointer" }}
+      title="点击内容进行编辑"
+    >
       {keys.map((key) => (
         <section className="note-section" key={key}>
           <Title heading={6}>{key}</Title>
@@ -1333,11 +1343,13 @@ function SoapNote({
   note,
   status,
   isEditing,
+  onStartEdit,
   onChange,
 }: {
   note: ClinicalNote | null;
   status?: string;
   isEditing?: boolean;
+  onStartEdit?: () => void;
   onChange?: (note: ClinicalNote) => void;
 }) {
   if (status === "generating_note" || status === "queued_note_generation") {
@@ -1405,7 +1417,11 @@ function SoapNote({
 
   if (note.raw_text) {
     return (
-      <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.6, padding: "8px 16px" }}>
+      <div
+        onClick={onStartEdit}
+        style={{ whiteSpace: "pre-wrap", lineHeight: 1.6, padding: "8px 16px", cursor: "pointer" }}
+        title="点击内容进行编辑"
+      >
         <Text>{note.raw_text}</Text>
       </div>
     );
@@ -1418,7 +1434,12 @@ function SoapNote({
   }
 
   return (
-    <div className="note-stack">
+    <div
+      className="note-stack clickable-note-stack"
+      onClick={onStartEdit}
+      style={{ cursor: "pointer" }}
+      title="点击内容进行编辑"
+    >
       {keys.map((key) => (
         <section className="note-section" key={key}>
           <Title heading={6}>{key}</Title>
