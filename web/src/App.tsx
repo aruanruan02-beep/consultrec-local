@@ -1047,7 +1047,7 @@ function SessionDetailView({
                 <Space>
                   {isEditingNote ? (
                     <>
-                      <Button size="small" type="primary" status="success" loading={savingNote} onClick={handleSaveNote}>
+                      <Button size="small" type="primary" loading={savingNote} onClick={handleSaveNote}>
                         保存
                       </Button>
                       <Button size="small" type="text" onClick={() => setIsEditingNote(false)}>
@@ -1242,6 +1242,9 @@ function ClinicalSummary({
   }
   if (!note) return <Empty description="确认角色后，系统会生成 Session Summary。" />;
 
+  const summary = note.session_summary || {};
+  const keys = Object.keys(summary);
+
   if (isEditing) {
     if (note.raw_text !== undefined && note.raw_text !== null) {
       return (
@@ -1257,8 +1260,6 @@ function ClinicalSummary({
         </div>
       );
     }
-    const summary = note.session_summary || {};
-    const keys = Object.keys(summary);
     if (keys.length === 0) {
       return (
         <div style={{ padding: "8px 16px" }}>
@@ -1280,14 +1281,14 @@ function ClinicalSummary({
       );
     }
     return (
-      <div className="note-stack" style={{ padding: "8px 16px" }}>
+      <div className="note-stack">
         {keys.map((key) => {
           const val = (summary[key] || []).join("\n");
           return (
-            <section className="note-section" key={key} style={{ marginBottom: "16px" }}>
-              <Title heading={6} style={{ marginBottom: "8px" }}>{key}</Title>
+            <section className="note-section" key={key}>
+              <Title heading={6}>{key}</Title>
               <TextArea
-                autoSize={{ minRows: 4, maxRows: 12 }}
+                autoSize={{ minRows: 4, maxRows: 15 }}
                 value={val}
                 onChange={(newVal) => {
                   const updatedSummary = { ...summary };
@@ -1316,8 +1317,6 @@ function ClinicalSummary({
     );
   }
 
-  const summary = note.session_summary || {};
-  const keys = Object.keys(summary);
   if (keys.length === 0) {
     return <Empty description="未输出 Session Summary 记录内容。" />;
   }
@@ -1361,6 +1360,9 @@ function SoapNote({
   }
   if (!note) return <Empty description="确认角色后，系统会生成 SOAP 记录。" />;
 
+  const soap = note.soap || {};
+  const keys = ["S (主观感觉)", "O (客观表现)", "A (评估分析)", "P (后续计划)"];
+
   if (isEditing) {
     if (note.raw_text !== undefined && note.raw_text !== null) {
       return (
@@ -1376,8 +1378,6 @@ function SoapNote({
         </div>
       );
     }
-    const soap = note.soap || {};
-    const keys = ["S (主观感觉)", "O (客观表现)", "A (评估分析)", "P (后续计划)"];
 
     // Ensure all keys exist in draft
     const ensureSoap = { ...soap };
@@ -1386,19 +1386,14 @@ function SoapNote({
     });
 
     return (
-      <div className="note-stack" style={{ padding: "8px 16px" }}>
+      <div className="note-stack">
         {keys.map((key) => {
           const val = (ensureSoap[key] || []).join("\n");
           return (
-            <section className="note-section" key={key} style={{ marginBottom: "16px" }}>
-              <Title heading={6} style={{ marginBottom: "8px" }}>
-                {key}{" "}
-                <span style={{ fontSize: "12px", color: "var(--color-text-3)", fontWeight: "normal" }}>
-                  (每行代表一条记录)
-                </span>
-              </Title>
+            <section className="note-section" key={key}>
+              <Title heading={6}>{key}</Title>
               <TextArea
-                autoSize={{ minRows: 3, maxRows: 8 }}
+                autoSize={{ minRows: 2, maxRows: 8 }}
                 value={val}
                 onChange={(newVal) => {
                   const updatedSoap = { ...ensureSoap };
@@ -1427,9 +1422,8 @@ function SoapNote({
     );
   }
 
-  const soap = note.soap || {};
-  const keys = Object.keys(soap);
-  if (keys.length === 0) {
+  const activeSoapKeys = Object.keys(soap);
+  if (activeSoapKeys.length === 0) {
     return <Empty description="未输出 SOAP 记录内容。" />;
   }
 
@@ -1440,7 +1434,7 @@ function SoapNote({
       style={{ cursor: "pointer" }}
       title="点击内容进行编辑"
     >
-      {keys.map((key) => (
+      {activeSoapKeys.map((key) => (
         <section className="note-section" key={key}>
           <Title heading={6}>{key}</Title>
           <NoteList items={soap[key]} />
