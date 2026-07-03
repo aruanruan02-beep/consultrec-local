@@ -88,6 +88,18 @@ class PipelineUnitTests(unittest.TestCase):
         self.assertEqual(note.soap["S"], ["来访者说睡不好"])
         self.assertEqual(note.session_summary["本次主题"], ["睡眠"])
 
+    def test_parse_clinical_note_repairs_malformed_json(self):
+        malformed_raw = (
+            '```json { "session_summary": { "本次会谈整体摘要": "咨询师询问来访者今天的感觉，来访者表示还好" }, '
+            '"soap": [ ["S (主观感觉)"]: ["烦躁", "焦虑"], ["O (客观表现)"]: [逐字稿中未明确提及], '
+            '["A (评估分析)"]: [逐字稿中未明确提及], ["P (后续计划)"]: [逐字稿中未明确提及] ] } ```'
+        )
+        note = parse_clinical_note(malformed_raw)
+        self.assertIsNone(note.raw_text)
+        self.assertEqual(note.session_summary["本次会谈整体摘要"], ["咨询师询问来访者今天的感觉，来访者表示还好"])
+        self.assertEqual(note.soap["S (主观感觉)"], ["烦躁", "焦虑"])
+        self.assertEqual(note.soap["O (客观表现)"], ["逐字稿中未明确提及"])
+
 
 if __name__ == "__main__":
     unittest.main()

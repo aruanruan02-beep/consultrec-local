@@ -59,6 +59,9 @@ def run_llm_command(
 def parse_clinical_note(text: str) -> ClinicalNote:
     payload = _extract_json(text)
     if payload is None:
+        payload = _fallback_regex_extract(text)
+
+    if payload is None:
         return ClinicalNote(
             soap={},
             session_summary={},
@@ -88,19 +91,128 @@ def parse_clinical_note(text: str) -> ClinicalNote:
     )
 
 
+def clean_json_string(s: str) -> str:
+    # 1. Replace unquoted text in lists like [逐字稿中未明确提及] -> ["逐字稿中未明确提及"]
+    s = re.sub(r'\[\s*([^"\'\]\s,]+)\s*\]', r'["\1"]', s)
+    
+    # 2. Fix key wrapped in array brackets: ["S (主观感觉)"]: -> "S (主观感觉)":
+    s = re.sub(r'\[\s*("[^"]+")\s*\]\s*:', r'\1:', s)
+    
+    # 3. Fix "soap": [ ... ] to "soap": { ... } if it contains key-value colons
+    if '"soap":' in s or '"soap"\s*:' in s:
+        match = re.search(r'"soap"\s*:\s*\[', s)
+        if match:
+            start_idx = match.end() - 1
+            depth = 1
+            end_idx = -1
+            for i in range(start_idx + 1, len(s)):
+                if s[i] == '[':
+                    depth += 1
+                elif s[i] == ']':
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i
+                        break
+            if end_idx != -1:
+                inner_content = s[start_idx+1 : end_idx]
+                if ':' in inner_content:
+                    s = s[:start_idx] + '{' + inner_content + '}' + s[end_idx+1:]
+    return s
+
+
+def _fallback_regex_extract(text: str) -> Optional[dict]:
+    # Extract "本次会谈整体摘要"
+    summary_match = re.search(r'"本次会谈整体摘要"\s*:\s*"([^"]+)"', text)
+    if not summary_match:
+        summary_match = re.search(r'本次会谈整体摘要\s*[:：]\s*(.+?)(?=\n\n|\n[#-*]|$)', text, flags=re.DOTALL)
+        
+    summary_text = summary_match.group(1).strip() if summary_match else ""
+    
+    # Try to extract SOAP sections
+    soap_sections = {
+        "S (主观感觉)": ["S (主观感觉)", "S", "主观感觉"],
+        "O (客观表现)": ["O (客观表现)", "O", "客观表现"],
+        "A (评估分析)": ["A (评估分析)", "A", "评估分析"],
+        "P (后续计划)": ["P (后续计划)", "P", "后续计划"]
+    }
+    
+    soap_data = {}
+    has_soap = False
+    
+    for key, aliases in soap_sections.items():
+        for alias in aliases:
+            # 1. JSON-like array pattern
+            pattern = rf'"{re.escape(alias)}"\s*:\s*\[(.*?)\]'
+            match = re.search(pattern, text, flags=re.DOTALL)
+            if match:
+                items_str = match.group(1)
+                items = re.findall(r'"([^"]+)"', items_str)
+                if not items:
+                    # Fallback for unquoted items, split by comma
+                    items = [item.strip().strip('"\'') for item in items_str.split(",") if item.strip()]
+                if items:
+                    soap_data[key] = items
+                    has_soap = True
+                    break
+            
+            # 2. Plain text list pattern
+            pattern_text = rf'(?:{re.escape(alias)}|"{re.escape(alias)}")\s*[:：]\s*(.+?)(?=\n\n|\n[#-*]|\n\w+\s*[:：]|$)'
+            match_text = re.search(pattern_text, text, flags=re.DOTALL)
+            if match_text:
+                content = match_text.group(1).strip()
+                bullets = re.findall(r'(?:[-*•]|\d+\.)\s*(.+)', content)
+                if bullets:
+                    soap_data[key] = [b.strip() for b in bullets]
+                else:
+                    items = [item.strip().strip('"\'') for item in re.split(r'[，,]', content) if item.strip()]
+                    soap_data[key] = items if items else [content.strip('"\'')]
+                has_soap = True
+                break
+                
+    if summary_text or has_soap:
+        payload = {}
+        if summary_text:
+            payload["session_summary"] = {"本次会谈整体摘要": summary_text}
+        if has_soap:
+            payload["soap"] = soap_data
+        return payload
+        
+    return None
+
+
 def _extract_json(text: str):
     stripped = text.strip()
-    candidates = [stripped]
-    fenced = re.findall(r"```(?:json)?\s*(.*?)```", stripped, flags=re.DOTALL)
-    candidates.extend(fenced)
-    brace = re.search(r"(\{.*\})", stripped, flags=re.DOTALL)
-    if brace:
-        candidates.append(brace.group(1))
+    
+    # Try parsing cleaned string first
+    cleaned = clean_json_string(stripped)
+    candidates = [cleaned, stripped]
+    
+    # Try finding fenced block in cleaned
+    fenced_cleaned = re.findall(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.DOTALL)
+    candidates.extend(fenced_cleaned)
+    
+    # Try finding fenced block in original
+    fenced_stripped = re.findall(r"```(?:json)?\s*(.*?)```", stripped, flags=re.DOTALL)
+    candidates.extend(fenced_stripped)
+    
+    # Try finding braces in cleaned
+    brace_cleaned = re.search(r"(\{.*\})", cleaned, flags=re.DOTALL)
+    if brace_cleaned:
+        candidates.append(brace_cleaned.group(1))
+        
+    # Try finding braces in original
+    brace_stripped = re.search(r"(\{.*\})", stripped, flags=re.DOTALL)
+    if brace_stripped:
+        candidates.append(brace_stripped.group(1))
+        
     for candidate in candidates:
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
-            continue
+            try:
+                return json.loads(clean_json_string(candidate))
+            except json.JSONDecodeError:
+                continue
     return None
 
 
