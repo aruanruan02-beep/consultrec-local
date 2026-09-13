@@ -1,20 +1,25 @@
 import os
+import selectors
 import signal
 import shlex
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List
 
 from .config import LocalSettings
-from .diarization import assign_roles
 from .llm import run_llm_command
-from .models import TranscriptSegment
+from .models import DiarizationTurn, TranscriptSegment
 from .prompts import load_clinical_prompt
 from .render import render_markdown
 from .storage import LocalRepository, SessionRecord
-from .transcript import load_transcript_json, merge_semantic_segments, merge_short_segments, save_transcript_json, transcript_for_prompt
+from .transcript import (
+    load_transcript_document,
+    load_transcript_json,
+    save_transcript_document,
+    transcript_for_prompt,
+)
+from .turns import build_edited_segments, normalize_diarization_turns
 
 
 class TaskCanceled(RuntimeError):
@@ -42,7 +47,7 @@ def run_transcription_stage(settings: LocalSettings, repo: LocalRepository, reco
 
     record.status = "transcribing"
     repo.save_session(record)
-    repo.append_log(record, "Starting WhisperX transcription.")
+    repo.append_log(record, "Starting local ASR transcription.")
 
     session_dir = repo.find_session_dir(record.case_id, record.session_id)
     transcript_path = session_dir / "transcript.json"
@@ -61,22 +66,15 @@ def run_transcription_stage(settings: LocalSettings, repo: LocalRepository, reco
             f"Whisper command completed but did not create transcript JSON: {transcript_path}"
         )
 
-    segments = merge_short_segments(load_transcript_json(transcript_path))
-    save_transcript_json(transcript_path, segments)
-    if settings.diarization_command.strip():
-        record.status = "diarizing"
-        repo.save_session(record)
-        repo.append_log(record, "Starting speaker diarization.")
-        segments = _run_diarization(settings, repo, record, segments)
-    segments = merge_semantic_segments(segments)
-    save_transcript_json(transcript_path, segments)
-
+    asr_segments = load_transcript_json(transcript_path)
+    for segment in asr_segments:
+        segment.speaker = "未确认"
+    save_transcript_document(transcript_path, asr_segments, asr_segments)
     record.transcript_path = str(transcript_path)
-    record.status = "awaiting_review"
-    record.process_pid = 0
+    record.status = "diarizing"
     repo.save_session(record)
-    repo.append_log(record, "Transcript is ready for role review.")
-    return record
+    repo.append_log(record, "ASR transcript is ready. Starting local speaker-turn diarization.")
+    return run_diarization_stage(settings, repo, record, automatic=True)
 
 
 def generate_clinical_note(settings: LocalSettings, repo: LocalRepository, record: SessionRecord) -> SessionRecord:
@@ -92,7 +90,7 @@ def generate_clinical_note(settings: LocalSettings, repo: LocalRepository, recor
     repo.save_session(record)
     repo.append_log(record, "Starting clinical note generation.")
 
-    segments = load_transcript_json(Path(record.transcript_path))
+    segments = load_transcript_document(Path(record.transcript_path))["edited_segments"]
     prompt = load_clinical_prompt(settings.prompt_path, transcript_for_prompt(segments))
     note = run_llm_command(
         settings.llm_command,
@@ -120,7 +118,9 @@ def generate_clinical_note(settings: LocalSettings, repo: LocalRepository, recor
     return record
 
 
-def run_diarization_stage(settings: LocalSettings, repo: LocalRepository, record: SessionRecord) -> SessionRecord:
+def run_diarization_stage(
+    settings: LocalSettings, repo: LocalRepository, record: SessionRecord, automatic: bool = False
+) -> SessionRecord:
     if not settings.diarization_command.strip():
         raise ValueError("Speaker diarization command is not configured.")
     if not record.transcript_path:
@@ -134,18 +134,19 @@ def run_diarization_stage(settings: LocalSettings, repo: LocalRepository, record
     record.note_json_path = ""
     record.markdown_path = ""
     repo.save_session(record)
-    repo.append_log(record, "Starting speaker diarization.")
+    repo.append_log(record, "Starting local speaker-turn diarization.")
 
     transcript_path = Path(record.transcript_path)
-    segments = merge_short_segments(load_transcript_json(transcript_path))
-    segments = _run_diarization(settings, repo, record, segments)
-    segments = merge_semantic_segments(segments)
-    save_transcript_json(transcript_path, segments)
+    document = load_transcript_document(transcript_path)
+    turns = _run_diarization(settings, repo, record)
+    turns = normalize_diarization_turns(turns)
+    segments, suppressed_turns = build_edited_segments(document["asr_segments"], turns)
+    save_transcript_document(transcript_path, document["asr_segments"], segments, turns, suppressed_turns)
 
     record.status = "awaiting_review"
     record.process_pid = 0
     repo.save_session(record)
-    repo.append_log(record, "Speaker diarization is ready for role review.")
+    repo.append_log(record, f"Speaker-turn transcript is ready for review ({len(segments)} segments).")
     return record
 
 
@@ -168,10 +169,39 @@ def update_transcript_roles(repo: LocalRepository, record: SessionRecord, segmen
                 text=text,
             )
         )
+    _validate_edited_segments(segments)
     transcript_path = Path(record.transcript_path)
-    save_transcript_json(transcript_path, segments)
-    repo.append_log(record, "Transcript roles were updated by user review.")
+    document = load_transcript_document(transcript_path)
+    save_transcript_document(
+        transcript_path, document["asr_segments"], segments, document["diarization_turns"], document["suppressed_turns"]
+    )
+    repo.append_log(record, "Edited transcript was saved by user review.")
     return record
+
+
+def restore_short_responses(repo: LocalRepository, record: SessionRecord) -> SessionRecord:
+    if not record.transcript_path:
+        raise ValueError("Transcript is not ready.")
+    transcript_path = Path(record.transcript_path)
+    document = load_transcript_document(transcript_path)
+    if not document["diarization_turns"]:
+        raise ValueError("Speaker-turn diarization is not available.")
+    segments, _ = build_edited_segments(
+        document["asr_segments"], document["diarization_turns"], collapse_acknowledgements=False
+    )
+    save_transcript_document(transcript_path, document["asr_segments"], segments, document["diarization_turns"], [])
+    repo.append_log(record, "Short acknowledgement turns were restored for review.")
+    return record
+
+
+def _validate_edited_segments(segments: List[TranscriptSegment]) -> None:
+    previous_end = -1.0
+    for segment in segments:
+        if segment.end <= segment.start:
+            raise ValueError("Transcript segment end time must be after its start time.")
+        if segment.start < previous_end - 0.001:
+            raise ValueError("Transcript segment times must not overlap.")
+        previous_end = segment.end
 
 
 def mark_error(repo: LocalRepository, record: SessionRecord, error: Exception) -> SessionRecord:
@@ -190,48 +220,66 @@ def mark_error(repo: LocalRepository, record: SessionRecord, error: Exception) -
     return record
 
 
-def _run_diarization(
-    settings: LocalSettings,
-    repo: LocalRepository,
-    record: SessionRecord,
-    segments: List[TranscriptSegment],
-) -> List[TranscriptSegment]:
-    # Custom diarization commands can still map speaker turns back onto transcript segments,
-    # but role inference is intentionally left to user review.
-    return assign_roles(
-        segments=segments,
-        mode="preserve",
-        diarization_command=settings.diarization_command,
-        audio_path=Path(record.audio_path),
-        work_dir=repo.find_session_dir(record.case_id, record.session_id),
+def _run_diarization(settings: LocalSettings, repo: LocalRepository, record: SessionRecord) -> List[DiarizationTurn]:
+    session_dir = repo.find_session_dir(record.case_id, record.session_id)
+    output_path = session_dir / "diarization.json"
+    command = settings.diarization_command.format(
+        audio=record.audio_path,
+        diarization_json=str(output_path),
+        output_dir=str(session_dir),
     )
+    _run_cancelable_command(command, repo, record)
+    if not output_path.exists():
+        raise FileNotFoundError("Diarization command completed without creating diarization JSON.")
+    payload = __import__("json").loads(output_path.read_text(encoding="utf-8"))
+    turns = payload.get("turns", payload.get("segments", []))
+    return [DiarizationTurn(float(item["start"]), float(item["end"]), str(item["speaker"])) for item in turns]
 
 
 def _run_cancelable_command(command: str, repo: LocalRepository, record: SessionRecord) -> None:
-    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
-        mode="w+", encoding="utf-8"
-    ) as stderr_file:
-        process = subprocess.Popen(shlex.split(command), stdout=stdout_file, stderr=stderr_file, text=True)
+    output_lines: List[str] = []
+    selector = selectors.DefaultSelector()
+    process = subprocess.Popen(
+        shlex.split(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        if process.stdout:
+            selector.register(process.stdout, selectors.EVENT_READ)
         _record_process_pid(repo, record, process.pid)
+        while process.poll() is None:
+            latest = repo.get_session(record.case_id, record.session_id)
+            if latest.status == "canceled":
+                _terminate_pid(process.pid)
+                raise TaskCanceled("Task was canceled by user.")
+            for key, _ in selector.select(timeout=0.8):
+                line = key.fileobj.readline()
+                if line:
+                    clean_line = line.rstrip()
+                    output_lines.append(clean_line)
+                    repo.append_log(record, clean_line)
+
+        if process.stdout:
+            for line in process.stdout:
+                clean_line = line.rstrip()
+                if clean_line:
+                    output_lines.append(clean_line)
+                    repo.append_log(record, clean_line)
+
+        if process.returncode != 0:
+            message = "\n".join(line for line in output_lines if line).strip()
+            raise RuntimeError(message or f"Command returned non-zero exit status {process.returncode}.")
+    finally:
+        selector.close()
         try:
-            while process.poll() is None:
-                latest = repo.get_session(record.case_id, record.session_id)
-                if latest.status == "canceled":
-                    _terminate_pid(process.pid)
-                    raise TaskCanceled("Task was canceled by user.")
-                time.sleep(0.8)
-            if process.returncode != 0:
-                stderr_file.seek(0)
-                stdout_file.seek(0)
-                message = (stderr_file.read() or stdout_file.read() or "").strip()
-                raise RuntimeError(message or f"Command returned non-zero exit status {process.returncode}.")
-        finally:
-            try:
-                latest = repo.get_session(record.case_id, record.session_id)
-            except FileNotFoundError:
-                return
-            latest.process_pid = 0
-            repo.save_session(latest)
+            latest = repo.get_session(record.case_id, record.session_id)
+        except FileNotFoundError:
+            return
+        latest.process_pid = 0
+        repo.save_session(latest)
 
 
 def _record_process_pid(repo: LocalRepository, record: SessionRecord, pid: int) -> None:
@@ -273,9 +321,9 @@ def _matching_session_processes(record: SessionRecord) -> List[tuple]:
             continue
         is_session_process = audio_path in command or session_id in command
         is_known_worker = (
-            "transcribe_faster_whisper.py" in command
-            or "transcribe_whisperx.py" in command
+            "transcribe_mlx_whisper.py" in command
             or "generate_note_ollama.py" in command
+            or "diarize_pyannote.py" in command
         )
         if is_session_process and is_known_worker:
             matches.append((pid, command))

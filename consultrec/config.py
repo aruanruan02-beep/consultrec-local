@@ -6,13 +6,14 @@ from typing import Any, Dict
 
 
 DEFAULT_CONFIG_PATH = Path("config/local_settings.json")
+ENV_PATH = Path(".env")
 
 
 @dataclass
 class LocalSettings:
     data_root: str = "data"
-    whisper_command: str = ".venv/bin/python scripts/transcribe_whisperx.py --audio {audio} --output {transcript_json} --model small --language zh --device cpu --compute-type int8 --min-speakers 2 --max-speakers 2"
-    diarization_command: str = ""
+    whisper_command: str = ".venv/bin/python scripts/transcribe_mlx_whisper.py --audio {audio} --output {transcript_json} --model mlx-community/whisper-small-mlx --language zh"
+    diarization_command: str = ".pyannote-venv/bin/python scripts/diarize_pyannote.py --audio {audio} --output {diarization_json} --num-speakers 2"
     llm_command: str = ""
     clinical_prompt_path: str = "prompts/clinical_note_prompt.md"
     hf_token: str = ""
@@ -27,12 +28,14 @@ class LocalSettings:
 
 
 def load_settings(path: Path = DEFAULT_CONFIG_PATH) -> LocalSettings:
+    _load_dotenv(ENV_PATH)
     if not path.exists():
         return LocalSettings()
     data = json.loads(path.read_text(encoding="utf-8"))
     settings = LocalSettings(**{**asdict(LocalSettings()), **data})
-    if settings.hf_token:
-        os.environ["HF_TOKEN"] = settings.hf_token
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or settings.hf_token
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
     return settings
 
 
@@ -52,3 +55,17 @@ def settings_from_dict(data: Dict[str, Any]) -> LocalSettings:
         if key in data:
             current[key] = str(data[key])
     return LocalSettings(**current)
+
+
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value

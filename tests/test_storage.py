@@ -47,7 +47,7 @@ class StorageTests(unittest.TestCase):
 
     def test_enrich_session_summary_maps_review_action(self):
         data = enrich_session_summary({"status": "awaiting_review", "audio_path": "/tmp/audio.wav"})
-        self.assertEqual(data["progress_label"], "等待角色确认")
+        self.assertEqual(data["progress_label"], "等待逐字稿校对")
         self.assertEqual(data["next_action"], "review")
 
     def test_cancel_and_delete_session(self):

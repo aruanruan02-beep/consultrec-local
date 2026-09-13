@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 import shlex
@@ -20,6 +21,19 @@ DEFAULT_NOTE = {
         "关键转折点": [],
     },
 }
+
+SUMMARY_KEYS = (
+    "咨询记录",
+)
+
+SOAP_KEYS = (
+    "S",
+    "O",
+    "A",
+    "P",
+)
+
+MISSING_VALUE = "逐字稿中未明确提及"
 
 
 def run_llm_command(
@@ -84,6 +98,9 @@ def parse_clinical_note(text: str) -> ClinicalNote:
         for k, v in payload.items():
             summary[k] = _as_list(v)
 
+    summary = _normalize_sections(summary, SUMMARY_KEYS)
+    soap = _normalize_sections(soap, SOAP_KEYS)
+
     return ClinicalNote(
         soap=soap,
         session_summary=summary,
@@ -92,6 +109,11 @@ def parse_clinical_note(text: str) -> ClinicalNote:
 
 
 def clean_json_string(s: str) -> str:
+    s = s.strip()
+    s = s.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```$", "", s)
+
     # 1. Replace unquoted text in lists like [逐字稿中未明确提及] -> ["逐字稿中未明确提及"]
     s = re.sub(r'\[\s*([^"\'\]\s,]+)\s*\]', r'["\1"]', s)
     
@@ -121,19 +143,19 @@ def clean_json_string(s: str) -> str:
 
 
 def _fallback_regex_extract(text: str) -> Optional[dict]:
-    # Extract "本次会谈整体摘要"
-    summary_match = re.search(r'"本次会谈整体摘要"\s*:\s*"([^"]+)"', text)
+    summary_match = re.search(r'"(?:咨询记录|本次咨询内容总结|本次会谈整体摘要)"\s*:\s*"([^"]+)"', text)
     if not summary_match:
-        summary_match = re.search(r'本次会谈整体摘要\s*[:：]\s*(.+?)(?=\n\n|\n[#-*]|$)', text, flags=re.DOTALL)
+        summary_match = re.search(r'(?:咨询记录|本次咨询内容总结|本次会谈整体摘要)\s*[:：]\s*(.+?)(?=\n\n|\n[#-*]|$)', text, flags=re.DOTALL)
         
     summary_text = summary_match.group(1).strip() if summary_match else ""
+    plain_summary_items = _extract_plain_summary_items(text)
     
     # Try to extract SOAP sections
     soap_sections = {
-        "S (主观感觉)": ["S (主观感觉)", "S", "主观感觉"],
-        "O (客观表现)": ["O (客观表现)", "O", "客观表现"],
-        "A (评估分析)": ["A (评估分析)", "A", "评估分析"],
-        "P (后续计划)": ["P (后续计划)", "P", "后续计划"]
+        "S": ["S (主观感觉)", "S", "主观感觉"],
+        "O": ["O (客观表现)", "O", "客观表现"],
+        "A": ["A (评估分析)", "A", "评估分析"],
+        "P": ["P (后续计划)", "P", "后续计划"],
     }
     
     soap_data = {}
@@ -169,10 +191,12 @@ def _fallback_regex_extract(text: str) -> Optional[dict]:
                 has_soap = True
                 break
                 
-    if summary_text or has_soap:
+    if summary_text or plain_summary_items or has_soap:
         payload = {}
         if summary_text:
-            payload["session_summary"] = {"本次会谈整体摘要": summary_text}
+            payload["session_summary"] = {"咨询记录": summary_text}
+        elif plain_summary_items:
+            payload["session_summary"] = {"咨询记录": plain_summary_items}
         if has_soap:
             payload["soap"] = soap_data
         return payload
@@ -183,36 +207,144 @@ def _fallback_regex_extract(text: str) -> Optional[dict]:
 def _extract_json(text: str):
     stripped = text.strip()
     
-    # Try parsing cleaned string first
     cleaned = clean_json_string(stripped)
     candidates = [cleaned, stripped]
     
-    # Try finding fenced block in cleaned
     fenced_cleaned = re.findall(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.DOTALL)
     candidates.extend(fenced_cleaned)
     
-    # Try finding fenced block in original
     fenced_stripped = re.findall(r"```(?:json)?\s*(.*?)```", stripped, flags=re.DOTALL)
     candidates.extend(fenced_stripped)
     
-    # Try finding braces in cleaned
-    brace_cleaned = re.search(r"(\{.*\})", cleaned, flags=re.DOTALL)
-    if brace_cleaned:
-        candidates.append(brace_cleaned.group(1))
-        
-    # Try finding braces in original
-    brace_stripped = re.search(r"(\{.*\})", stripped, flags=re.DOTALL)
-    if brace_stripped:
-        candidates.append(brace_stripped.group(1))
+    candidates.extend(_balanced_json_objects(cleaned))
+    candidates.extend(_balanced_json_objects(stripped))
         
     for candidate in candidates:
+        payload = _loads_lenient(candidate)
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _loads_lenient(candidate: str):
+    variants = [
+        candidate,
+        clean_json_string(candidate),
+        _strip_trailing_commas(clean_json_string(candidate)),
+    ]
+    for variant in variants:
+        if not variant.strip():
+            continue
         try:
-            return json.loads(candidate)
+            return json.loads(variant)
         except json.JSONDecodeError:
             try:
-                return json.loads(clean_json_string(candidate))
-            except json.JSONDecodeError:
+                return ast.literal_eval(variant)
+            except (ValueError, SyntaxError):
                 continue
+    return None
+
+
+def _balanced_json_objects(text: str):
+    objects = []
+    start = None
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start : index + 1])
+                start = None
+    return objects
+
+
+def _strip_trailing_commas(text: str) -> str:
+    return re.sub(r",\s*([}\]])", r"\1", text)
+
+
+def _extract_plain_summary_items(text: str) -> list:
+    cleaned = re.sub(r"```.*?```", "", text, flags=re.DOTALL).strip()
+    if not cleaned:
+        return []
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    items = []
+    current = ""
+    for line in lines:
+        line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+        match = re.match(r"^(?:[-*]|\d+[.、])\s*(.+)$", line)
+        if match:
+            if current:
+                items.append(current.strip())
+            current = match.group(1).strip()
+        elif current:
+            current = f"{current} {line}".strip()
+    if current:
+        items.append(current.strip())
+    items = [_remove_advice_tail(item) for item in items]
+    items = [item for item in items if item and not _looks_like_advice(item)]
+    if items:
+        return items
+    if len(cleaned) >= 30 and not _looks_like_json_instruction(cleaned):
+        return [_remove_advice_tail(cleaned)]
+    return []
+
+
+def _looks_like_advice(text: str) -> bool:
+    advice_markers = ("建议", "可以提供", "帮助来访者", "需要找到", "应该", "最好")
+    return any(marker in text for marker in advice_markers)
+
+
+def _remove_advice_tail(text: str) -> str:
+    for marker in ("咨询师可以", "建议", "总的来说"):
+        index = text.find(marker)
+        if index > 0:
+            return text[:index].strip(" ，。；;")
+    return text.strip()
+
+
+def _looks_like_json_instruction(text: str) -> bool:
+    return "session_summary" in text or "soap" in text or "{{TRANSCRIPT}}" in text
+
+
+def _normalize_sections(data: dict, required_keys: tuple) -> dict:
+    normalized = {}
+    for key in required_keys:
+        value = data.get(key)
+        if value is None:
+            value = _find_by_key_fragment(data, key)
+        items = [item.strip() for item in _as_list(value) if str(item).strip()]
+        normalized[key] = items or [MISSING_VALUE]
+    for key, value in data.items():
+        if key not in normalized:
+            items = [item.strip() for item in _as_list(value) if str(item).strip()]
+            if items:
+                normalized[key] = items
+    return normalized
+
+
+def _find_by_key_fragment(data: dict, target: str):
+    prefix = target.split(" ", 1)[0]
+    for key, value in data.items():
+        if str(key).strip() == target:
+            return value
+        if prefix in str(key) and (target in str(key) or str(key) in target):
+            return value
     return None
 
 

@@ -14,10 +14,7 @@ fi
 echo ""
 echo "Python dependencies installed."
 echo ""
-echo "WhisperX diarization requires a Hugging Face read token."
-echo "Accept the pyannote speaker diarization model terms, then run:"
-echo ""
-echo "  export HF_TOKEN=\"your_huggingface_read_token\""
+echo "The default WhisperX ASR-only flow does not require a Hugging Face token."
 echo ""
 echo "Next install Ollama from https://ollama.com/download/mac if it is not installed."
 echo "After Ollama is running, run:"
@@ -26,7 +23,7 @@ echo "  ollama pull qwen2.5:7b-instruct"
 echo ""
 echo "Then update config/local_settings.json with:"
 echo ""
-echo '  "whisper_command": ".venv/bin/python scripts/transcribe_whisperx.py --audio {audio} --output {transcript_json} --model small --language zh --device cpu --compute-type int8 --min-speakers 2 --max-speakers 2",'
+echo '  "whisper_command": ".venv/bin/python scripts/transcribe_mlx_whisper.py --audio {audio} --output {transcript_json} --model mlx-community/whisper-small-mlx --language zh",'
 echo '  "diarization_command": "",'
 echo '  "llm_command": ".venv/bin/python scripts/generate_note_ollama.py --prompt-file {prompt_file} --model qwen2.5:7b-instruct"'
 echo ""

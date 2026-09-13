@@ -48,8 +48,8 @@ ollama pull qwen2.5:7b-instruct
 ```json
 {
   "data_root": "data",
-  "whisper_command": ".venv/bin/python scripts/transcribe_whisperx.py --audio {audio} --output {transcript_json} --model small --language zh --device cpu --compute-type int8 --min-speakers 2 --max-speakers 2",
-  "diarization_command": "",
+  "whisper_command": ".venv/bin/python scripts/transcribe_mlx_whisper.py --audio {audio} --output {transcript_json} --model mlx-community/whisper-small-mlx --language zh",
+  "diarization_command": ".pyannote-venv/bin/python scripts/diarize_pyannote.py --audio {audio} --output {diarization_json} --num-speakers 2",
   "llm_command": ".venv/bin/python scripts/generate_note_ollama.py --prompt-file {prompt_file} --model qwen2.5:7b-instruct",
   "clinical_prompt_path": "prompts/clinical_note_prompt.md"
 }

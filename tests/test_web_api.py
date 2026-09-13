@@ -37,7 +37,7 @@ class WebApiTests(unittest.TestCase):
         from consultrec.config import LocalSettings
         from consultrec.models import TranscriptSegment
         from consultrec.storage import LocalRepository
-        from consultrec.transcript import save_transcript_json
+        from consultrec.transcript import save_transcript_document
         from consultrec import web
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -49,11 +49,15 @@ class WebApiTests(unittest.TestCase):
             source_audio.write_bytes(b"fake audio")
             record = repository.create_session("CASE 200", "2026-07-03", source_audio, "audio.m4a")
             transcript_path = repository.find_session_dir(record.case_id, record.session_id) / "transcript.json"
-            save_transcript_json(
+            save_transcript_document(
                 transcript_path,
                 [
                     TranscriptSegment(0, 1, "你好", "说话人 1"),
                     TranscriptSegment(1, 2, "你好", "说话人 2"),
+                ],
+                [
+                    TranscriptSegment(0, 1, "已校对的文字", "咨询师"),
+                    TranscriptSegment(1, 2, "你好", "未确认"),
                 ],
             )
             record.transcript_path = str(transcript_path)
@@ -63,9 +67,25 @@ class WebApiTests(unittest.TestCase):
             detail = client.get(f"/api/sessions/{record.case_id}/{record.session_id}")
             self.assertEqual(detail.status_code, 200)
             self.assertEqual(
-                [item["speaker"] for item in detail.json()["transcript"]],
+                [item["speaker"] for item in detail.json()["asr_segments"]],
                 ["说话人 1", "说话人 2"],
             )
+            self.assertEqual(detail.json()["edited_segments"][0]["text"], "已校对的文字")
+
+            saved = client.post(
+                f"/api/sessions/{record.case_id}/{record.session_id}/transcript",
+                json={
+                    "segments": [
+                        {"start": 0, "end": 0.5, "speaker": "咨询师", "text": "拆分后的前半段"},
+                        {"start": 0.5, "end": 1, "speaker": "咨询师", "text": "拆分后的后半段"},
+                        {"start": 1, "end": 2, "speaker": "未确认", "text": "你好"},
+                    ]
+                },
+            )
+            self.assertEqual(saved.status_code, 200)
+            updated = client.get(f"/api/sessions/{record.case_id}/{record.session_id}").json()
+            self.assertEqual(len(updated["asr_segments"]), 2)
+            self.assertEqual(len(updated["edited_segments"]), 3)
 
     def test_save_clinical_note_endpoint(self):
         from fastapi.testclient import TestClient

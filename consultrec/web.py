@@ -1,4 +1,5 @@
 import json
+import mimetypes
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -13,12 +14,13 @@ from .processor import (
     cancel_running_session,
     generate_clinical_note,
     mark_error,
+    restore_short_responses,
     run_diarization_stage,
     run_transcription_stage,
     update_transcript_roles,
 )
 from .storage import LocalRepository, enrich_session_summary, validate_audio_filename
-from .transcript import load_transcript_json, merge_semantic_segments
+from .transcript import load_transcript_document
 
 
 app = FastAPI(title="本地咨询录音处理系统")
@@ -47,6 +49,8 @@ def index():
 def get_config():
     current_settings = settings()
     res = current_settings.__dict__.copy()
+    # Tokens are process-local credentials and must never be returned to the browser.
+    res["hf_token"] = ""
     prompt_path = current_settings.prompt_path
     if prompt_path.exists():
         res["prompt_template"] = prompt_path.read_text(encoding="utf-8")
@@ -64,6 +68,7 @@ async def update_config(payload: Dict[str, str]):
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(payload["prompt_template"], encoding="utf-8")
     res = new_settings.__dict__.copy()
+    res["hf_token"] = ""
     prompt_path = new_settings.prompt_path
     if prompt_path.exists():
         res["prompt_template"] = prompt_path.read_text(encoding="utf-8")
@@ -148,15 +153,27 @@ def get_session(case_id: str, session_id: str):
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     payload = enrich_session_summary(record.__dict__)
-    payload["diarization_configured"] = bool(current_settings.diarization_command.strip())
     if record.transcript_path and Path(record.transcript_path).exists():
-        payload["transcript"] = [
-            item.to_dict()
-            for item in merge_semantic_segments(load_transcript_json(Path(record.transcript_path)))
-        ]
+        document = load_transcript_document(Path(record.transcript_path))
+        payload["asr_segments"] = [item.to_dict() for item in document["asr_segments"]]
+        payload["edited_segments"] = [item.to_dict() for item in document["edited_segments"]]
+        payload["diarization_turns"] = [item.to_dict() for item in document["diarization_turns"]]
+        payload["suppressed_turns"] = [item.to_dict() for item in document["suppressed_turns"]]
+        # Keep the current frontend and older API clients working during migration.
+        payload["transcript"] = payload["edited_segments"]
     if record.note_json_path and Path(record.note_json_path).exists():
         payload["clinical_note"] = json.loads(Path(record.note_json_path).read_text(encoding="utf-8"))
     return payload
+
+
+@app.get("/api/sessions/{case_id}/{session_id}/audio")
+def get_session_audio(case_id: str, session_id: str):
+    record = repo().get_session(case_id, session_id)
+    audio_path = Path(record.audio_path)
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file is not available.")
+    media_type, _ = mimetypes.guess_type(audio_path.name)
+    return FileResponse(audio_path, media_type=media_type or "application/octet-stream", filename=audio_path.name)
 
 
 @app.get("/api/sessions/{case_id}/{session_id}/logs")
@@ -206,6 +223,17 @@ async def save_transcript(
     return enrich_session_summary(record.__dict__)
 
 
+@app.post("/api/sessions/{case_id}/{session_id}/short-responses/restore")
+async def restore_suppressed_short_responses(case_id: str, session_id: str):
+    repository = repo()
+    record = repository.get_session(case_id, session_id)
+    try:
+        restore_short_responses(repository, record)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return get_session(case_id, session_id)
+
+
 @app.post("/api/sessions/{case_id}/{session_id}/note")
 async def save_clinical_note(
     case_id: str,
@@ -220,12 +248,11 @@ async def save_clinical_note(
 
     # Update markdown if transcript exists
     if record.transcript_path and Path(record.transcript_path).exists():
-        from .transcript import load_transcript_json
         from .render import render_markdown
         from .llm import _as_list
         from .models import ClinicalNote as ModelClinicalNote
 
-        segments = load_transcript_json(Path(record.transcript_path))
+        segments = load_transcript_document(Path(record.transcript_path))["edited_segments"]
 
         soap_raw = payload.get("soap", {})
         soap = {}
@@ -319,7 +346,15 @@ def _transcribe_background(case_id: str, session_id: str) -> None:
     try:
         run_transcription_stage(settings(), repository, record)
     except Exception as exc:
-        mark_error(repository, record, exc)
+        latest = repository.get_session(case_id, session_id)
+        if latest.transcript_path:
+            latest.status = "diarization_failed"
+            latest.error_message = str(exc)
+            latest.process_pid = 0
+            repository.save_session(latest)
+            repository.append_log(latest, f"Diarization failed; ASR transcript was kept: {exc}")
+        else:
+            mark_error(repository, record, exc)
 
 
 def _generate_note_background(case_id: str, session_id: str) -> None:
@@ -337,7 +372,12 @@ def _diarize_background(case_id: str, session_id: str) -> None:
     try:
         run_diarization_stage(settings(), repository, record)
     except Exception as exc:
-        mark_error(repository, record, exc)
+        latest = repository.get_session(case_id, session_id)
+        latest.status = "diarization_failed"
+        latest.error_message = str(exc)
+        latest.process_pid = 0
+        repository.save_session(latest)
+        repository.append_log(latest, f"Diarization failed; ASR transcript was kept: {exc}")
 
 
 app.mount("/static", StaticFiles(directory=BASE_DIR / "web" / "static"), name="static")

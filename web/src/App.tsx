@@ -45,6 +45,7 @@ const PROCESSING_STATUSES = new Set([
   "uploaded",
   "queued_transcription",
   "transcribing",
+  "grouping_transcript",
   "diarizing",
   "queued_note_generation",
   "generating_note",
@@ -53,7 +54,7 @@ const PROCESSING_STATUSES = new Set([
 const DEFAULT_SETTINGS: Settings = {
   data_root: "data",
   whisper_command:
-    ".venv/bin/python scripts/transcribe_whisperx.py --audio {audio} --output {transcript_json} --model small --language zh --device cpu --compute-type int8 --min-speakers 2 --max-speakers 2",
+    ".venv/bin/python scripts/transcribe_mlx_whisper.py --audio {audio} --output {transcript_json} --model mlx-community/whisper-small-mlx --language zh",
   diarization_command: "",
   llm_command: ".venv/bin/python scripts/generate_note_ollama.py --prompt-file {prompt_file} --model qwen2.5:7b-instruct",
   clinical_prompt_path: "prompts/clinical_note_prompt.md",
@@ -96,7 +97,10 @@ type ClinicalNote = {
 };
 
 type SessionDetail = SessionSummary & {
-  diarization_configured?: boolean;
+  asr_segments?: TranscriptSegment[];
+  edited_segments?: TranscriptSegment[];
+  diarization_turns?: Array<{ start: number; end: number; speaker: string }>;
+  suppressed_turns?: TranscriptSegment[];
   transcript?: TranscriptSegment[];
   clinical_note?: ClinicalNote;
   audio_path?: string;
@@ -156,7 +160,7 @@ function statusColor(status?: string) {
   if (status === "complete") return "green";
   if (status === "error") return "red";
   if (status === "canceled") return "gray";
-  if (status === "awaiting_review") return "orange";
+  if (status === "awaiting_review" || status === "diarization_failed") return "orange";
   if (status && PROCESSING_STATUSES.has(status)) return "arcoblue";
   return "gray";
 }
@@ -164,7 +168,8 @@ function statusColor(status?: string) {
 function progressHint(item: Partial<SessionSummary>) {
   if (item.error_message) return "处理失败，可点击重试或进入详情查看";
   if (item.is_processing) return "系统正在本地处理，请稍候";
-  if (item.status === "awaiting_review") return "请确认咨询师 / 来访者角色";
+  if (item.status === "awaiting_review") return "请校对逐字稿、段落和说话人";
+  if (item.status === "diarization_failed") return "发言轮次整理未完成，可重试或先校对 ASR 初稿";
   if (item.status === "complete") return "SOAP 与 Summary 已生成";
   return "等待处理";
 }
@@ -194,9 +199,6 @@ function normalizeSpeaker(value?: string): Speaker {
 function summarizeWhisper(command: string) {
   if (!command) return "尚未配置";
   const modelMatch = command.match(/--model\s+([^\s]+)/);
-  if (command.includes("transcribe_whisperx.py") || command.includes("whisperx")) {
-    return `WhisperX ${modelMatch ? modelMatch[1] : "本地模型"}`;
-  }
   return `Whisper ${modelMatch ? modelMatch[1] : "本地模型"}`;
 }
 
@@ -224,6 +226,17 @@ function NoteList({ items }: { items?: string[] }) {
         <li key={`${item}-${index}`}>{item}</li>
       ))}
     </ul>
+  );
+}
+
+function NoteParagraphs({ items }: { items?: string[] }) {
+  const values = items && items.length ? items : ["逐字稿中未明确提及"];
+  return (
+    <div style={{ display: "grid", gap: 12, lineHeight: 1.8, whiteSpace: "pre-wrap" }}>
+      {values.map((item, index) => (
+        <Text key={`${item}-${index}`}>{item}</Text>
+      ))}
+    </div>
   );
 }
 
@@ -273,7 +286,7 @@ export default function App() {
       `/api/sessions/${encodeURIComponent(caseId)}/${encodeURIComponent(sessionId)}`
     );
     setCurrentSession(data);
-    setTranscriptDraft(data.transcript || []);
+    setTranscriptDraft(data.edited_segments || data.transcript || []);
     setView("session");
   }, []);
 
@@ -283,7 +296,7 @@ export default function App() {
       `/api/sessions/${encodeURIComponent(currentSession.case_id)}/${encodeURIComponent(currentSession.session_id)}`
     );
     setCurrentSession(data);
-    setTranscriptDraft(data.transcript || []);
+    setTranscriptDraft(data.edited_segments || data.transcript || []);
   }, [currentSession]);
 
   const loadSettings = useCallback(async () => {
@@ -372,13 +385,13 @@ export default function App() {
     if (currentSession?.session_id === item.session_id) await refreshCurrentSession();
   };
 
-  const saveTranscript = async (data: SessionDetail) => {
+  const saveTranscript = async (data: SessionDetail, quiet = false) => {
     await api(`/api/sessions/${data.case_id}/${data.session_id}/transcript`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ segments: transcriptDraft }),
     });
-    Message.success("逐字稿修改已保存");
+    if (!quiet) Message.success("逐字稿修改已保存");
   };
 
   const saveClinicalNote = async (data: SessionDetail, notePayload: ClinicalNote) => {
@@ -659,13 +672,13 @@ export default function App() {
             }}
             onRefresh={refreshCurrentSession}
             onRetry={() => retryTranscription(currentSession.case_id, currentSession.session_id)}
-            onRerunDiarization={() => rerunDiarization(currentSession.case_id, currentSession.session_id)}
-            onRegenerate={() => submitReview(currentSession)}
+            onDiarize={() => rerunDiarization(currentSession.case_id, currentSession.session_id)}
             onSaveTranscript={async () => {
               await saveTranscript(currentSession);
               await refreshCurrentSession();
               await loadSessions();
             }}
+            onAutoSave={() => saveTranscript(currentSession, true)}
             onSubmitReview={() => submitReview(currentSession)}
             onSaveClinicalNote={async (notePayload) => {
               if (currentSession) {
@@ -865,9 +878,9 @@ function SessionDetailView({
   onBack,
   onRefresh,
   onRetry,
-  onRerunDiarization,
-  onRegenerate,
+  onDiarize,
   onSaveTranscript,
+  onAutoSave,
   onSubmitReview,
   onSaveClinicalNote,
 }: {
@@ -877,9 +890,9 @@ function SessionDetailView({
   onBack: () => void;
   onRefresh: () => void;
   onRetry: () => void;
-  onRerunDiarization: () => void;
-  onRegenerate: () => void;
+  onDiarize: () => void;
   onSaveTranscript: () => Promise<void> | void;
+  onAutoSave: () => Promise<void> | void;
   onSubmitReview: () => Promise<void> | void;
   onSaveClinicalNote: (note: ClinicalNote) => Promise<void> | void;
 }) {
@@ -889,16 +902,33 @@ function SessionDetailView({
   const [isEditingNote, setIsEditingNote] = useState<boolean>(false);
   const [noteDraft, setNoteDraft] = useState<ClinicalNote | null>(null);
   const [savingNote, setSavingNote] = useState<boolean>(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const lastSavedDraft = useRef("");
 
   useEffect(() => {
-    if (data.status === "awaiting_review") {
+    if (data.status === "awaiting_review" || data.status === "diarization_failed") {
       setEditMode(true);
     } else {
       setEditMode(false);
     }
     setIsEditingNote(false);
     setNoteDraft(null);
+    lastSavedDraft.current = JSON.stringify(transcriptDraft);
   }, [data.session_id, data.status]);
+
+  useEffect(() => {
+    if (!editMode || disabled || !transcriptDraft.length) return;
+    const serialized = JSON.stringify(transcriptDraft);
+    if (serialized === lastSavedDraft.current) return;
+    const timer = window.setTimeout(() => {
+      Promise.resolve(onAutoSave())
+        .then(() => {
+          lastSavedDraft.current = serialized;
+        })
+        .catch((error: unknown) => Message.error(`自动保存失败：${error instanceof Error ? error.message : String(error)}`));
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [transcriptDraft, editMode, disabled, onAutoSave]);
 
   const handleStartEditNote = () => {
     if (data.clinical_note) {
@@ -953,6 +983,66 @@ function SessionDetailView({
     setTranscriptDraft(transcriptDraft.map((item, current) => (current === index ? { ...item, ...patch } : item)));
   };
 
+  const setSegmentText = (index: number, text: string) => {
+    if (!text.trim()) {
+      setTranscriptDraft(transcriptDraft.filter((_, current) => current !== index));
+      return;
+    }
+    setSegment(index, { text });
+  };
+
+  const seekToSegment = (start: number) => {
+    const audio = audioRef.current;
+    if (audio) audio.currentTime = start;
+  };
+
+  const splitAtCursor = (event: React.KeyboardEvent<HTMLTextAreaElement>, index: number, item: TranscriptSegment) => {
+    if (event.key !== "Enter" || event.shiftKey) return;
+
+    event.preventDefault();
+    const cursor = event.currentTarget.selectionStart;
+    const text = item.text || "";
+    const before = text.slice(0, cursor);
+    const after = text.slice(cursor);
+    const textLength = before.length + after.length;
+    const splitTime = Math.round(
+      (item.start + (item.end - item.start) * (textLength ? before.length / textLength : 0.5)) * 100
+    ) / 100;
+
+    const next = [...transcriptDraft];
+    next[index] = { ...item, text: before, end: splitTime };
+    next.splice(index + 1, 0, {
+      start: splitTime,
+      end: item.end,
+      speaker: item.speaker,
+      text: after,
+    });
+    setTranscriptDraft(next);
+
+    window.setTimeout(() => {
+      const nextTextarea = document.querySelector(`.segment-textarea-${index + 1}`) as HTMLTextAreaElement | null;
+      nextTextarea?.focus();
+      nextTextarea?.setSelectionRange(0, 0);
+    }, 50);
+  };
+
+  const mergeWithPrevious = (index: number) => {
+    if (index < 1) return;
+    const previous = transcriptDraft[index - 1];
+    const current = transcriptDraft[index];
+    const speaker = normalizeSpeaker(String(previous.speaker || "未确认")) === normalizeSpeaker(String(current.speaker || "未确认"))
+      ? normalizeSpeaker(String(previous.speaker || "未确认"))
+      : "未确认";
+    const next = [...transcriptDraft];
+    next.splice(index - 1, 2, {
+      start: previous.start,
+      end: current.end,
+      speaker,
+      text: [previous.text?.trim(), current.text?.trim()].filter(Boolean).join("\n"),
+    });
+    setTranscriptDraft(next);
+  };
+
   const [speakerModalVisible, setSpeakerModalVisible] = useState(false);
   const [speakerEditIndex, setSpeakerEditIndex] = useState<number | null>(null);
   const [speakerOldValue, setSpeakerOldValue] = useState("");
@@ -983,50 +1073,6 @@ function SessionDetailView({
     return combined;
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>, index: number, item: TranscriptSegment) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      const textarea = e.currentTarget;
-      const cursorPos = textarea.selectionStart;
-      const text = item.text || "";
-      const part1 = text.substring(0, cursorPos);
-      const part2 = text.substring(cursorPos);
-
-      const start = item.start;
-      const end = item.end;
-      const l1 = part1.length;
-      const l2 = part2.length;
-      let splitTime = start + (end - start) / 2;
-      if (l1 + l2 > 0) {
-        splitTime = start + (end - start) * (l1 / (l1 + l2));
-      }
-      splitTime = Math.round(splitTime * 100) / 100;
-
-      const newSegments = [...transcriptDraft];
-      newSegments[index] = {
-        ...item,
-        text: part1,
-        end: splitTime,
-      };
-      const newSeg: TranscriptSegment = {
-        start: splitTime,
-        end: end,
-        speaker: item.speaker,
-        text: part2,
-      };
-      newSegments.splice(index + 1, 0, newSeg);
-      setTranscriptDraft(newSegments);
-
-      setTimeout(() => {
-        const nextTextarea = document.querySelector(`.segment-textarea-${index + 1}`) as HTMLTextAreaElement | null;
-        if (nextTextarea) {
-          nextTextarea.focus();
-          nextTextarea.setSelectionRange(0, 0);
-        }
-      }, 50);
-    }
-  };
-
   return (
     <section className="page session-page">
       <div className="detail-header">
@@ -1043,10 +1089,9 @@ function SessionDetailView({
         </div>
         <Space wrap className="detail-actions">
           {data.status === "error" && <Button onClick={onRetry}>重新转写</Button>}
-          {Boolean(data.transcript?.length && data.diarization_configured && !data.is_processing) && (
-            <Button icon={<IconRobot />} onClick={onRerunDiarization}>
-              重新自动整理
-            </Button>
+          {data.status === "diarization_failed" && <Button onClick={onDiarize}>重试整理发言轮次</Button>}
+          {data.transcript_path && (data.status === "awaiting_review" || data.status === "complete") && (
+            <Button onClick={onDiarize}>重新整理发言轮次</Button>
           )}
           <Button icon={<IconRefresh />} onClick={onRefresh}>
             刷新
@@ -1104,6 +1149,14 @@ function SessionDetailView({
         <section className="transcript-pane">
           <div className="pane-head">
             <Title heading={5}>文字记录</Title>
+            {data.audio_path && (
+              <audio
+                ref={audioRef}
+                controls
+                className="transcript-audio"
+                src={`/api/sessions/${encodeURIComponent(data.case_id)}/${encodeURIComponent(data.session_id)}/audio`}
+              />
+            )}
           </div>
           {data.is_processing && !transcriptDraft.length ? (
             <div className="processing-empty-state">
@@ -1114,7 +1167,7 @@ function SessionDetailView({
           ) : (
             <div className="transcript-list">
               {transcriptDraft.map((item, index) => (
-                <div className="segment" key={`${item.start}-${item.end}-${index}`}>
+                <div className="segment" key={`${item.start}-${item.end}-${index}`} onClick={() => seekToSegment(item.start)}>
                   <Text type="secondary" className="segment-time">
                     {formatTime(item.start)} - {formatTime(item.end)}
                   </Text>
@@ -1136,9 +1189,12 @@ function SessionDetailView({
                         className={`segment-textarea-${index}`}
                         disabled={disabled}
                         autoSize={{ minRows: 2, maxRows: 8 }}
-                        onChange={(text) => setSegment(index, { text })}
-                        onKeyDown={(e) => handleKeyDown(e, index, item)}
+                        onChange={(text) => setSegmentText(index, text)}
+                        onKeyDown={(event) => splitAtCursor(event, index, item)}
                       />
+                      <div className="segment-tools">
+                        {index > 0 && <Button size="mini" type="text" onClick={() => mergeWithPrevious(index)}>与上一段合并</Button>}
+                      </div>
                     </>
                   ) : (
                     <>
@@ -1257,7 +1313,7 @@ function ClinicalSummary({
       </div>
     );
   }
-  if (!note) return <Empty description="确认角色后，系统会生成 Session Summary。" />;
+  if (!note) return <Empty description="确认逐字稿后，系统会生成 Session Summary。" />;
 
   const summary = note.session_summary || {};
   const keys = Object.keys(summary);
@@ -1287,7 +1343,7 @@ function ClinicalSummary({
               if (onChange) {
                 onChange({
                   ...note,
-                  session_summary: { "本次会谈整体摘要": [""] }
+                  session_summary: { "咨询记录": [""] }
                 });
               }
             }}
@@ -1348,7 +1404,7 @@ function ClinicalSummary({
       {keys.map((key) => (
         <section className="note-section" key={key}>
           <Title heading={6}>{key}</Title>
-          <NoteList items={summary[key]} />
+          {key === "咨询记录" ? <NoteParagraphs items={summary[key]} /> : <NoteList items={summary[key]} />}
         </section>
       ))}
     </div>

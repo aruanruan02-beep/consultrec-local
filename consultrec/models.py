@@ -8,14 +8,28 @@ class TranscriptSegment:
     end: float
     text: str
     speaker: Optional[str] = None
+    boundary_review: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "start": self.start,
             "end": self.end,
             "speaker": self.speaker or "未确认",
             "text": self.text,
         }
+        if self.boundary_review:
+            data["boundary_review"] = True
+        return data
+
+
+@dataclass
+class DiarizationTurn:
+    start: float
+    end: float
+    speaker: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"start": self.start, "end": self.end, "speaker": self.speaker}
 
 
 @dataclass

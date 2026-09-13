@@ -51,16 +51,22 @@ def render_markdown(
             f"**{segment.speaker or '未确认'}**：{segment.text}"
         )
 
-    lines.extend(["", "## SOAP", ""])
-    for key in ["S", "O", "A", "P"]:
-        lines.append(f"### {key}")
-        lines.extend(_bullet_list(note.soap.get(key, [])))
-        lines.append("")
+    if not _all_missing(note.soap):
+        lines.extend(["", "## SOAP", ""])
+        soap_keys = list(note.soap.keys()) or ["S", "O", "A", "P"]
+        for key in soap_keys:
+            lines.append(f"### {key}")
+            lines.extend(_bullet_list(note.soap.get(key, [])))
+            lines.append("")
 
-    lines.extend(["## Session Summary", ""])
-    for key in ["本次主题", "核心问题", "情绪变化", "咨询师主要回应方式", "会谈结构", "关键转折点"]:
+    lines.extend(["## 咨询记录", ""])
+    summary_keys = list(note.session_summary.keys()) or ["咨询记录"]
+    for key in summary_keys:
         lines.append(f"### {key}")
-        lines.extend(_bullet_list(note.session_summary.get(key, [])))
+        if key == "咨询记录":
+            lines.extend(_paragraphs(note.session_summary.get(key, [])))
+        else:
+            lines.extend(_bullet_list(note.session_summary.get(key, [])))
         lines.append("")
 
     if note.raw_text:
@@ -73,3 +79,19 @@ def _bullet_list(items):
     if not items:
         return ["- 逐字稿中未明确提及"]
     return [f"- {item}" for item in items]
+
+
+def _paragraphs(items):
+    if not items:
+        return ["逐字稿中未明确提及"]
+    lines = []
+    for item in items:
+        lines.extend([item, ""])
+    return lines[:-1]
+
+
+def _all_missing(sections):
+    if not sections:
+        return True
+    values = [item for items in sections.values() for item in items]
+    return bool(values) and all(item == "逐字稿中未明确提及" for item in values)

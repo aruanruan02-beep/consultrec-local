@@ -1,73 +1,77 @@
+import copy
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-from .models import TranscriptSegment
+from .models import DiarizationTurn, TranscriptSegment
+
+
+_ASCII_TO_FULLWIDTH_PUNCTUATION = str.maketrans({
+    ",": "，",
+    ".": "。",
+    ":": "：",
+    ";": "；",
+    "?": "？",
+    "!": "！",
+    "(": "（",
+    ")": "）",
+    "[": "【",
+    "]": "】",
+})
+
+
+def normalize_chinese_punctuation(text: str) -> str:
+    """Use Chinese full-width punctuation in transcript text."""
+    normalized = str(text or "")
+    normalized = re.sub(r"\.{3,}", "……", normalized)
+    return normalized.translate(_ASCII_TO_FULLWIDTH_PUNCTUATION)
 
 
 def load_transcript_json(path: Path) -> List[TranscriptSegment]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    raw_segments = _extract_segments(data)
+    raw_segments = _extract_segments(data, preferred_key="edited_segments")
     return [_segment_from_dict(item) for item in raw_segments]
 
 
 def save_transcript_json(path: Path, segments: Iterable[TranscriptSegment]) -> None:
-    payload = {"segments": [segment.to_dict() for segment in segments]}
+    payload = {"segments": [_segment_to_dict(segment) for segment in segments]}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def merge_short_segments(
-    segments: Iterable[TranscriptSegment],
-    target_duration: float = 12.0,
-    max_duration: float = 18.0,
-    max_gap: float = 1.0,
-    max_chars: int = 180,
-) -> List[TranscriptSegment]:
-    merged: List[TranscriptSegment] = []
-    for segment in segments:
-        if not segment.text.strip():
-            continue
-        if not merged:
-            merged.append(segment)
-            continue
-        previous = merged[-1]
-        same_speaker = _normalized_speaker(previous.speaker) == _normalized_speaker(segment.speaker)
-        close_enough = segment.start - previous.end <= max_gap
-        short_enough = previous.end - previous.start < target_duration
-        within_limits = segment.end - previous.start <= max_duration and len(previous.text) + len(segment.text) <= max_chars
-        if same_speaker and close_enough and short_enough and within_limits:
-            previous.end = segment.end
-            previous.text = f"{previous.text.rstrip()} {segment.text.strip()}".strip()
-        else:
-            merged.append(segment)
-    return merged
+def load_transcript_document(path: Path) -> Dict[str, List[TranscriptSegment]]:
+    """Load current dual-layer transcripts and transparently read legacy files."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("asr_segments"), list):
+        asr_segments = [_segment_from_dict(item) for item in data["asr_segments"]]
+        edited_raw = data.get("edited_segments", data.get("segments", data["asr_segments"]))
+        if not isinstance(edited_raw, list):
+            raise ValueError("Transcript edited_segments must be a list.")
+        return {
+            "asr_segments": asr_segments,
+            "edited_segments": [_segment_from_dict(item) for item in edited_raw],
+            "diarization_turns": [_turn_from_dict(item) for item in data.get("diarization_turns", [])],
+            "suppressed_turns": [_segment_from_dict(item) for item in data.get("suppressed_turns", [])],
+        }
+
+    legacy = [_segment_from_dict(item) for item in _extract_segments(data)]
+    return {"asr_segments": copy.deepcopy(legacy), "edited_segments": legacy, "diarization_turns": [], "suppressed_turns": []}
 
 
-def merge_semantic_segments(
-    segments: Iterable[TranscriptSegment],
-    target_duration: float = 35.0,
-    max_duration: float = 55.0,
-    max_gap: float = 1.2,
-    max_chars: int = 520,
-) -> List[TranscriptSegment]:
-    merged: List[TranscriptSegment] = []
-    for segment in merge_short_segments(segments, target_duration=18.0, max_duration=24.0, max_chars=260):
-        if not segment.text.strip():
-            continue
-        if not merged:
-            merged.append(segment)
-            continue
-        previous = merged[-1]
-        same_speaker = _normalized_speaker(previous.speaker) == _normalized_speaker(segment.speaker)
-        close_enough = segment.start - previous.end <= max_gap
-        within_limits = segment.end - previous.start <= max_duration and len(previous.text) + len(segment.text) <= max_chars
-        should_continue = previous.end - previous.start < target_duration or _looks_like_continuation(segment.text)
-        if same_speaker and close_enough and within_limits and should_continue:
-            previous.end = segment.end
-            previous.text = f"{previous.text.rstrip()} {segment.text.strip()}".strip()
-        else:
-            merged.append(segment)
-    return merged
+def save_transcript_document(
+    path: Path,
+    asr_segments: Iterable[TranscriptSegment],
+    edited_segments: Iterable[TranscriptSegment],
+    diarization_turns: Iterable[DiarizationTurn] = (),
+    suppressed_turns: Iterable[TranscriptSegment] = (),
+) -> None:
+    payload = {
+        "asr_segments": [_segment_to_dict(segment) for segment in asr_segments],
+        "edited_segments": [_segment_to_dict(segment) for segment in edited_segments],
+        "diarization_turns": [turn.to_dict() for turn in diarization_turns],
+        "suppressed_turns": [_segment_to_dict(segment) for segment in suppressed_turns],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def transcript_for_prompt(segments: Iterable[TranscriptSegment]) -> str:
@@ -91,7 +95,11 @@ def format_time(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _extract_segments(data: Any) -> List[Dict[str, Any]]:
+def _extract_segments(data: Any, preferred_key: str = "segments") -> List[Dict[str, Any]]:
+    if isinstance(data, dict) and isinstance(data.get(preferred_key), list):
+        return data[preferred_key]
+    if isinstance(data, dict) and preferred_key != "segments" and isinstance(data.get("segments"), list):
+        return data["segments"]
     if isinstance(data, dict) and isinstance(data.get("segments"), list):
         return data["segments"]
     if isinstance(data, list):
@@ -109,37 +117,21 @@ def _segment_from_dict(item: Dict[str, Any]) -> TranscriptSegment:
     return TranscriptSegment(
         start=float(start),
         end=float(end),
-        text=str(text).strip(),
+        text=normalize_chinese_punctuation(str(text).strip()),
         speaker=str(speaker).strip() if speaker else None,
+        boundary_review=bool(item.get("boundary_review", False)),
     )
 
 
-def _normalized_speaker(value: str) -> str:
-    speaker = (value or "未确认").strip()
-    return speaker or "未确认"
+def _segment_to_dict(segment: TranscriptSegment) -> Dict[str, Any]:
+    payload = segment.to_dict()
+    payload["text"] = normalize_chinese_punctuation(segment.text).strip()
+    return payload
 
 
-def _looks_like_continuation(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return False
-    continuation_starts = (
-        "然后",
-        "所以",
-        "但是",
-        "不过",
-        "因为",
-        "就是",
-        "而且",
-        "同时",
-        "以及",
-        "那",
-        "嗯",
-        "对",
-        "好",
-        "还有",
-        "另外",
-        "接着",
-        "后来",
-    )
-    return stripped.startswith(continuation_starts)
+def _turn_from_dict(item: Dict[str, Any]) -> DiarizationTurn:
+    start = item.get("start")
+    end = item.get("end")
+    if start is None or end is None:
+        raise ValueError(f"Diarization turn is missing start/end: {item}")
+    return DiarizationTurn(start=float(start), end=float(end), speaker=str(item.get("speaker") or "未确认"))

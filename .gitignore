@@ -4,8 +4,12 @@ __pycache__/
 *.py[cod]
 
 .venv/
+.pyannote-venv/
 node_modules/
 tsconfig.tsbuildinfo
 .launcher/
 
 data/
+测试数据/
+.env
+config/local_settings.json
